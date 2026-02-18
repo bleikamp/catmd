@@ -1,10 +1,11 @@
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -20,7 +21,7 @@ use pulldown_cmark::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::prelude::{Color, Modifier, Rect, Style, Stylize};
+use ratatui::prelude::{Color, Modifier, Rect, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::block::Padding;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
@@ -31,6 +32,11 @@ use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
 const NO_TOC_HEADINGS_STATUS: &str = "No headings in TOC";
+const TIMELINE_DEFAULT_HEIGHT: u16 = 6;
+const TIMELINE_MIN_HEIGHT: u16 = 3;
+const BRIGHT_CHANGE_WINDOW: Duration = Duration::from_secs(2);
+const DIM_CHANGE_WINDOW: Duration = Duration::from_secs(15);
+const DIFF_MAX_CELLS: usize = 2_000_000;
 
 fn system_open<S: AsRef<OsStr>>(arg: S) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -71,6 +77,16 @@ fn usize_to_u16_saturating(value: usize) -> u16 {
     }
 }
 
+fn parse_history(value: &str) -> std::result::Result<usize, String> {
+    let parsed: usize = value
+        .parse()
+        .map_err(|_| "--history must be a positive integer".to_string())?;
+    if parsed == 0 {
+        return Err("--history must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "catmd",
@@ -92,6 +108,10 @@ struct Cli {
     /// Reload when the file changes (file input only).
     #[arg(long)]
     watch: bool,
+
+    /// Number of in-memory snapshots to keep while watching.
+    #[arg(long, default_value_t = 50, value_parser = parse_history)]
+    history: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +157,39 @@ struct LoadedDocument {
 struct HistoryEntry {
     path: PathBuf,
     scroll: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SectionDelta {
+    added: usize,
+    removed: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DiffHunk {
+    start_line: usize,
+    end_line: usize,
+    added: usize,
+    removed: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SnapshotDiff {
+    added: usize,
+    removed: usize,
+    hunks: Vec<DiffHunk>,
+    section_deltas: BTreeMap<usize, SectionDelta>,
+    top_section: Option<String>,
+    overflow: bool,
+}
+
+#[derive(Clone, Debug)]
+struct WatchSnapshot {
+    revision: u64,
+    created_at: SystemTime,
+    created_instant: Instant,
+    rendered: RenderedDocument,
+    diff: SnapshotDiff,
 }
 
 struct FileWatcher {
@@ -956,16 +1009,350 @@ fn classify_link(target: &str, current_doc: Option<&Path>) -> LinkAction {
     LinkAction::Unknown(target.to_string())
 }
 
+#[derive(Debug, Default)]
+struct LineDiffResult {
+    added: usize,
+    removed: usize,
+    hunks: Vec<DiffHunk>,
+    overflow: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DiffOp {
+    Equal,
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Copy)]
+enum ChangeFreshness {
+    Bright,
+    Dim,
+}
+
+fn change_freshness(created_instant: Instant) -> Option<ChangeFreshness> {
+    let age = created_instant.elapsed();
+    if age <= BRIGHT_CHANGE_WINDOW {
+        Some(ChangeFreshness::Bright)
+    } else if age <= DIM_CHANGE_WINDOW {
+        Some(ChangeFreshness::Dim)
+    } else {
+        None
+    }
+}
+
+fn format_clock_hms(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % 86_400;
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    format!("{hour:02}:{minute:02}:{second:02}")
+}
+
+fn truncate_label(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars().take(max_chars.saturating_sub(1)) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn heading_index_for_line(toc: &[TocEntry], line: usize) -> Option<usize> {
+    if toc.is_empty() {
+        return None;
+    }
+
+    toc.iter()
+        .enumerate()
+        .rfind(|(_, entry)| entry.line <= line)
+        .map(|(idx, _)| idx)
+        .or(Some(0))
+}
+
+fn hunk_anchor_line(hunk: &DiffHunk, total_lines: usize) -> usize {
+    if total_lines == 0 {
+        return 0;
+    }
+
+    if hunk.end_line > hunk.start_line {
+        hunk.start_line.min(total_lines.saturating_sub(1))
+    } else {
+        hunk.start_line
+            .saturating_sub(1)
+            .min(total_lines.saturating_sub(1))
+    }
+}
+
+fn touched_toc_indices_for_hunk(
+    hunk: &DiffHunk,
+    toc: &[TocEntry],
+    total_lines: usize,
+) -> Vec<usize> {
+    if toc.is_empty() {
+        return Vec::new();
+    }
+
+    let start_line = if total_lines == 0 {
+        0
+    } else {
+        hunk.start_line.min(total_lines.saturating_sub(1))
+    };
+    let end_line = if total_lines == 0 {
+        0
+    } else if hunk.end_line > hunk.start_line {
+        hunk.end_line
+            .saturating_sub(1)
+            .min(total_lines.saturating_sub(1))
+    } else {
+        hunk.start_line
+            .saturating_sub(1)
+            .min(total_lines.saturating_sub(1))
+    };
+
+    let from = start_line.min(end_line);
+    let to = start_line.max(end_line);
+    let Some(start_idx) = heading_index_for_line(toc, from) else {
+        return Vec::new();
+    };
+    let end_idx = heading_index_for_line(toc, to).unwrap_or(start_idx);
+    (start_idx..=end_idx).collect()
+}
+
+fn build_snapshot_diff(previous: &RenderedDocument, next: &RenderedDocument) -> SnapshotDiff {
+    let old_lines: Vec<&str> = previous
+        .lines
+        .iter()
+        .map(|line| line.plain.as_str())
+        .collect();
+    let new_lines: Vec<&str> = next.lines.iter().map(|line| line.plain.as_str()).collect();
+    let line_diff = compute_line_diff(&old_lines, &new_lines, DIFF_MAX_CELLS);
+
+    let mut section_deltas: BTreeMap<usize, SectionDelta> = BTreeMap::new();
+    for hunk in &line_diff.hunks {
+        let touched = touched_toc_indices_for_hunk(hunk, &next.toc, next.lines.len());
+        for idx in &touched {
+            section_deltas.entry(*idx).or_default();
+        }
+        if let Some(primary) = touched.first() {
+            let entry = section_deltas.entry(*primary).or_default();
+            entry.added = entry.added.saturating_add(hunk.added);
+            entry.removed = entry.removed.saturating_add(hunk.removed);
+        }
+    }
+
+    let top_section = section_deltas
+        .first_key_value()
+        .and_then(|(idx, _)| next.toc.get(*idx).map(|entry| entry.title.clone()));
+
+    SnapshotDiff {
+        added: line_diff.added,
+        removed: line_diff.removed,
+        hunks: line_diff.hunks,
+        section_deltas,
+        top_section,
+        overflow: line_diff.overflow,
+    }
+}
+
+fn compute_line_diff(old_lines: &[&str], new_lines: &[&str], max_cells: usize) -> LineDiffResult {
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut old_end = old_lines.len();
+    let mut new_end = new_lines.len();
+    while old_end > prefix
+        && new_end > prefix
+        && old_lines[old_end.saturating_sub(1)] == new_lines[new_end.saturating_sub(1)]
+    {
+        old_end = old_end.saturating_sub(1);
+        new_end = new_end.saturating_sub(1);
+    }
+
+    let old_mid = &old_lines[prefix..old_end];
+    let new_mid = &new_lines[prefix..new_end];
+
+    if old_mid.is_empty() && new_mid.is_empty() {
+        return LineDiffResult::default();
+    }
+
+    if old_mid.is_empty() {
+        return LineDiffResult {
+            added: new_mid.len(),
+            removed: 0,
+            hunks: vec![DiffHunk {
+                start_line: prefix,
+                end_line: prefix.saturating_add(new_mid.len()),
+                added: new_mid.len(),
+                removed: 0,
+            }],
+            overflow: false,
+        };
+    }
+
+    if new_mid.is_empty() {
+        return LineDiffResult {
+            added: 0,
+            removed: old_mid.len(),
+            hunks: vec![DiffHunk {
+                start_line: prefix,
+                end_line: prefix,
+                added: 0,
+                removed: old_mid.len(),
+            }],
+            overflow: false,
+        };
+    }
+
+    let rows = old_mid.len().saturating_add(1);
+    let cols = new_mid.len().saturating_add(1);
+    if rows.saturating_mul(cols) > max_cells {
+        return LineDiffResult {
+            added: new_mid.len(),
+            removed: old_mid.len(),
+            hunks: vec![DiffHunk {
+                start_line: prefix,
+                end_line: prefix.saturating_add(new_mid.len()),
+                added: new_mid.len(),
+                removed: old_mid.len(),
+            }],
+            overflow: true,
+        };
+    }
+
+    let mut table = vec![0u32; rows.saturating_mul(cols)];
+    for i in 1..rows {
+        for j in 1..cols {
+            let idx = i.saturating_mul(cols).saturating_add(j);
+            table[idx] = if old_mid[i.saturating_sub(1)] == new_mid[j.saturating_sub(1)] {
+                table[(i.saturating_sub(1))
+                    .saturating_mul(cols)
+                    .saturating_add(j.saturating_sub(1))]
+                .saturating_add(1)
+            } else {
+                table[(i.saturating_sub(1)).saturating_mul(cols).saturating_add(j)]
+                    .max(table[i.saturating_mul(cols).saturating_add(j.saturating_sub(1))])
+            };
+        }
+    }
+
+    let mut ops_reversed = Vec::with_capacity(old_mid.len().saturating_add(new_mid.len()));
+    let mut i = old_mid.len();
+    let mut j = new_mid.len();
+
+    while i > 0 && j > 0 {
+        if old_mid[i.saturating_sub(1)] == new_mid[j.saturating_sub(1)] {
+            ops_reversed.push(DiffOp::Equal);
+            i = i.saturating_sub(1);
+            j = j.saturating_sub(1);
+            continue;
+        }
+
+        let up = table[(i.saturating_sub(1)).saturating_mul(cols).saturating_add(j)];
+        let left = table[i.saturating_mul(cols).saturating_add(j.saturating_sub(1))];
+        if up >= left {
+            ops_reversed.push(DiffOp::Remove);
+            i = i.saturating_sub(1);
+        } else {
+            ops_reversed.push(DiffOp::Add);
+            j = j.saturating_sub(1);
+        }
+    }
+
+    while i > 0 {
+        ops_reversed.push(DiffOp::Remove);
+        i = i.saturating_sub(1);
+    }
+    while j > 0 {
+        ops_reversed.push(DiffOp::Add);
+        j = j.saturating_sub(1);
+    }
+
+    ops_reversed.reverse();
+
+    let mut hunks = Vec::new();
+    let mut current: Option<DiffHunk> = None;
+    let mut new_index = prefix;
+    let mut added = 0usize;
+    let mut removed = 0usize;
+
+    for op in ops_reversed {
+        match op {
+            DiffOp::Equal => {
+                new_index = new_index.saturating_add(1);
+                if let Some(hunk) = current.take() {
+                    hunks.push(hunk);
+                }
+            }
+            DiffOp::Add => {
+                added = added.saturating_add(1);
+                let hunk = current.get_or_insert(DiffHunk {
+                    start_line: new_index,
+                    end_line: new_index,
+                    added: 0,
+                    removed: 0,
+                });
+                hunk.added = hunk.added.saturating_add(1);
+                new_index = new_index.saturating_add(1);
+                hunk.end_line = new_index;
+            }
+            DiffOp::Remove => {
+                removed = removed.saturating_add(1);
+                let hunk = current.get_or_insert(DiffHunk {
+                    start_line: new_index,
+                    end_line: new_index,
+                    added: 0,
+                    removed: 0,
+                });
+                hunk.removed = hunk.removed.saturating_add(1);
+            }
+        }
+    }
+
+    if let Some(hunk) = current.take() {
+        hunks.push(hunk);
+    }
+
+    LineDiffResult {
+        added,
+        removed,
+        hunks,
+        overflow: false,
+    }
+}
+
 struct App {
     cli: Cli,
     syntax_set: SyntaxSet,
     theme: Theme,
     doc: LoadedDocument,
+    snapshots: VecDeque<WatchSnapshot>,
+    active_snapshot: usize,
+    next_revision: u64,
+    history_capacity: usize,
 
     scroll: u16,
     viewport_height: u16,
     toc_open: bool,
     toc_selected: usize,
+    timeline_open: bool,
+    timeline_height: u16,
 
     selected_link: Option<usize>,
     backstack: Vec<HistoryEntry>,
@@ -994,6 +1381,17 @@ impl App {
         } else {
             Some(0)
         };
+        let mut snapshots = VecDeque::new();
+        snapshots.push_back(WatchSnapshot {
+            revision: 1,
+            created_at: SystemTime::now(),
+            created_instant: Instant::now(),
+            rendered: rendered.clone(),
+            diff: SnapshotDiff::default(),
+        });
+
+        let history_capacity = cli.history.max(1);
+
         Self {
             cli,
             syntax_set,
@@ -1002,10 +1400,16 @@ impl App {
                 path: load.path,
                 rendered,
             },
+            snapshots,
+            active_snapshot: 0,
+            next_revision: 2,
+            history_capacity,
             scroll: 0,
             viewport_height: 1,
             toc_open: false,
             toc_selected: 0,
+            timeline_open: false,
+            timeline_height: TIMELINE_DEFAULT_HEIGHT,
             selected_link,
             backstack: Vec::new(),
             search_mode: false,
@@ -1016,6 +1420,221 @@ impl App {
             watcher: None,
             watch_requested: false,
         }
+    }
+
+    fn latest_snapshot_index(&self) -> usize {
+        self.snapshots.len().saturating_sub(1)
+    }
+
+    fn current_snapshot(&self) -> Option<&WatchSnapshot> {
+        self.snapshots.get(self.active_snapshot)
+    }
+
+    fn is_live_mode(&self) -> bool {
+        self.active_snapshot == self.latest_snapshot_index()
+    }
+
+    fn reset_snapshots_from_current_doc(&mut self) {
+        let revision = self.next_revision;
+        self.next_revision = self.next_revision.saturating_add(1);
+        self.snapshots.clear();
+        self.snapshots.push_back(WatchSnapshot {
+            revision,
+            created_at: SystemTime::now(),
+            created_instant: Instant::now(),
+            rendered: self.doc.rendered.clone(),
+            diff: SnapshotDiff::default(),
+        });
+        self.active_snapshot = 0;
+    }
+
+    fn sync_doc_with_active_snapshot(&mut self, old_scroll: u16, fallback_to_first_hunk: bool) {
+        let Some(snapshot) = self.current_snapshot().cloned() else {
+            return;
+        };
+
+        self.doc.rendered = snapshot.rendered;
+        self.selected_link = if self.doc.rendered.links.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+
+        self.update_search_matches();
+        if self.search_query.is_empty() || self.search_matches.is_empty() {
+            if old_scroll <= self.max_scroll() {
+                self.scroll = old_scroll;
+            } else if fallback_to_first_hunk {
+                if let Some(hunk) = snapshot.diff.hunks.first() {
+                    self.set_scroll_to_line(hunk_anchor_line(hunk, self.doc.rendered.lines.len()));
+                } else {
+                    self.scroll = self.max_scroll();
+                }
+            } else {
+                self.scroll = self.max_scroll();
+            }
+        }
+
+        self.clamp_scroll();
+        self.sync_toc_selected_with_scroll();
+    }
+
+    fn push_watch_snapshot(&mut self, rendered: RenderedDocument) -> bool {
+        let diff = self
+            .snapshots
+            .back()
+            .map(|previous| build_snapshot_diff(&previous.rendered, &rendered))
+            .unwrap_or_default();
+
+        if diff.hunks.is_empty() && diff.added == 0 && diff.removed == 0 {
+            return false;
+        }
+
+        let was_live = self.is_live_mode();
+        let old_scroll = self.scroll;
+        let revision = self.next_revision;
+        self.next_revision = self.next_revision.saturating_add(1);
+
+        self.snapshots.push_back(WatchSnapshot {
+            revision,
+            created_at: SystemTime::now(),
+            created_instant: Instant::now(),
+            rendered,
+            diff,
+        });
+
+        let mut selected_evicted = false;
+        while self.snapshots.len() > self.history_capacity {
+            self.snapshots.pop_front();
+            if self.active_snapshot > 0 {
+                self.active_snapshot = self.active_snapshot.saturating_sub(1);
+            } else {
+                selected_evicted = true;
+            }
+        }
+
+        if was_live {
+            self.active_snapshot = self.latest_snapshot_index();
+            self.sync_doc_with_active_snapshot(old_scroll, true);
+        } else if selected_evicted {
+            self.sync_doc_with_active_snapshot(old_scroll, true);
+        }
+
+        true
+    }
+
+    fn toggle_timeline(&mut self) {
+        if !self.cli.watch {
+            self.status = "Timeline is available only in --watch mode".to_string();
+            return;
+        }
+        self.timeline_open = !self.timeline_open;
+    }
+
+    fn move_revision_relative(&mut self, older: bool) {
+        if !self.cli.watch {
+            self.status = "Revision navigation is available only in --watch mode".to_string();
+            return;
+        }
+        if self.snapshots.len() <= 1 {
+            self.status = "No prior revisions yet".to_string();
+            return;
+        }
+
+        let next_index = if older {
+            self.active_snapshot.saturating_sub(1)
+        } else {
+            self.active_snapshot
+                .saturating_add(1)
+                .min(self.latest_snapshot_index())
+        };
+
+        if next_index == self.active_snapshot {
+            self.status = if older {
+                "Already at oldest revision".to_string()
+            } else {
+                "Already at latest revision".to_string()
+            };
+            return;
+        }
+
+        let old_scroll = self.scroll;
+        self.active_snapshot = next_index;
+        self.sync_doc_with_active_snapshot(old_scroll, true);
+
+        if let Some(snapshot) = self.current_snapshot() {
+            let behind = self
+                .latest_snapshot_index()
+                .saturating_sub(self.active_snapshot);
+            if behind == 0 {
+                self.status = format!("LIVE r{:03}", snapshot.revision);
+            } else {
+                self.status = format!("HISTORY r{:03} ({behind} behind LIVE)", snapshot.revision);
+            }
+        }
+    }
+
+    fn jump_to_live_revision(&mut self) {
+        if !self.cli.watch {
+            self.status = "Jump-to-live is available only in --watch mode".to_string();
+            return;
+        }
+        if self.snapshots.is_empty() {
+            return;
+        }
+        if self.is_live_mode() {
+            self.status = "Already on LIVE revision".to_string();
+            return;
+        }
+
+        let old_scroll = self.scroll;
+        self.active_snapshot = self.latest_snapshot_index();
+        self.sync_doc_with_active_snapshot(old_scroll, true);
+        if let Some(snapshot) = self.current_snapshot() {
+            self.status = format!("Returned to LIVE r{:03}", snapshot.revision);
+        }
+    }
+
+    fn jump_hunk_relative(&mut self, reverse: bool) {
+        let Some(snapshot) = self.current_snapshot().cloned() else {
+            self.status = "No active revision".to_string();
+            return;
+        };
+        if snapshot.diff.hunks.is_empty() {
+            self.status = "No changed hunks in selected revision".to_string();
+            return;
+        }
+
+        let total_lines = self.doc.rendered.lines.len();
+        let anchors: Vec<usize> = snapshot
+            .diff
+            .hunks
+            .iter()
+            .map(|hunk| hunk_anchor_line(hunk, total_lines))
+            .collect();
+
+        let cursor = usize::from(self.scroll);
+        let target = if reverse {
+            anchors
+                .iter()
+                .rfind(|line| **line < cursor)
+                .copied()
+                .unwrap_or_else(|| *anchors.last().unwrap_or(&0))
+        } else {
+            anchors
+                .iter()
+                .find(|line| **line > cursor)
+                .copied()
+                .unwrap_or_else(|| anchors.first().copied().unwrap_or(0))
+        };
+
+        self.set_scroll_to_line(target);
+        let hunk_number = anchors
+            .iter()
+            .position(|line| *line == target)
+            .map(|idx| idx.saturating_add(1))
+            .unwrap_or(1);
+        self.status = format!("Hunk {hunk_number}/{}", anchors.len());
     }
 
     fn max_scroll(&self) -> u16 {
@@ -1205,6 +1824,7 @@ impl App {
             self.scroll = 0;
         }
 
+        self.reset_snapshots_from_current_doc();
         self.update_search_matches();
         self.clamp_scroll();
         self.sync_toc_selected_with_scroll();
@@ -1221,8 +1841,52 @@ impl App {
             path: Some(path.clone()),
         };
 
-        self.set_doc(load, true);
-        self.status = format!("Reloaded {}", path.display());
+        let rendered = render_markdown(&load.source, &self.syntax_set, &self.theme);
+        self.doc.path = load.path;
+        let was_live = self.is_live_mode();
+
+        if self.push_watch_snapshot(rendered) {
+            if was_live {
+                if let Some(snapshot) = self.snapshots.back() {
+                    if snapshot.diff.overflow {
+                        self.status = format!(
+                            "Reloaded {} -> r{:03} (+{}/-{}, fallback diff)",
+                            path.display(),
+                            snapshot.revision,
+                            snapshot.diff.added,
+                            snapshot.diff.removed
+                        );
+                    } else {
+                        self.status = format!(
+                            "Reloaded {} -> r{:03} (+{}/-{}, sections:{})",
+                            path.display(),
+                            snapshot.revision,
+                            snapshot.diff.added,
+                            snapshot.diff.removed,
+                            snapshot.diff.section_deltas.len()
+                        );
+                    }
+                } else {
+                    self.status = format!("Reloaded {}", path.display());
+                }
+            } else {
+                let latest_rev = self
+                    .snapshots
+                    .back()
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(0);
+                let behind = self
+                    .latest_snapshot_index()
+                    .saturating_sub(self.active_snapshot);
+                self.status = format!(
+                    "LIVE advanced to r{:03}; viewing historical snapshot ({behind} behind)",
+                    latest_rev
+                );
+            }
+        } else {
+            self.status = format!("Reloaded {} (no text changes)", path.display());
+        }
+
         self.ensure_watcher()?;
         Ok(())
     }
@@ -1347,9 +2011,27 @@ impl App {
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         let root = inset_rect(frame.size(), 1, 0);
-        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(root);
-        let body = chunks[0];
-        let status = inset_rect(chunks[1], 1, 0);
+        let max_dock_height = root.height.saturating_sub(3);
+        let (body, timeline_area, status) = if self.cli.watch
+            && self.timeline_open
+            && max_dock_height >= TIMELINE_MIN_HEIGHT
+            && root.height >= 5
+        {
+            let dock_height = self
+                .timeline_height
+                .min(max_dock_height)
+                .max(TIMELINE_MIN_HEIGHT);
+            let chunks = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(dock_height),
+                Constraint::Length(1),
+            ])
+            .split(root);
+            (chunks[0], Some(chunks[1]), inset_rect(chunks[2], 1, 0))
+        } else {
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(root);
+            (chunks[0], None, inset_rect(chunks[1], 1, 0))
+        };
 
         let content_area = if self.toc_open {
             let widths = [
@@ -1367,6 +2049,9 @@ impl App {
         self.viewport_height = content_area.height.saturating_sub(1).max(1);
         self.clamp_scroll();
         self.draw_content(frame, content_area);
+        if let Some(area) = timeline_area {
+            self.draw_timeline(frame, area);
+        }
         self.draw_status(frame, status);
     }
 
@@ -1374,6 +2059,14 @@ impl App {
         let selected = self
             .toc_selected
             .min(self.doc.rendered.toc.len().saturating_sub(1));
+        let (active_diff, freshness) = if let Some(snapshot) = self.current_snapshot() {
+            (
+                Some(&snapshot.diff),
+                change_freshness(snapshot.created_instant),
+            )
+        } else {
+            (None, None)
+        };
 
         let items: Vec<ListItem> = self
             .doc
@@ -1383,11 +2076,38 @@ impl App {
             .enumerate()
             .map(|(idx, entry)| {
                 let indent = "  ".repeat(entry.level.saturating_sub(1) as usize);
-                let marker = if idx == selected { "> " } else { "  " };
-                let mut line = Line::raw(format!("{marker}{indent}{}", entry.title));
-                if idx == selected {
-                    line = line.fg(Color::Yellow).bold();
+                let row_style = if idx == selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let section_delta = active_diff.and_then(|diff| diff.section_deltas.get(&idx));
+                let mut title = format!("{indent}{}", entry.title);
+                if self.timeline_open {
+                    if let Some(delta) = section_delta {
+                        title.push_str(&format!(" (+{}/-{})", delta.added, delta.removed));
+                    }
                 }
+                let change_marker = if section_delta.is_some() && freshness.is_some() {
+                    let marker_style = match freshness {
+                        Some(ChangeFreshness::Bright) => Style::default()
+                            .fg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD),
+                        Some(ChangeFreshness::Dim) => Style::default().fg(Color::DarkGray),
+                        None => Style::default(),
+                    };
+                    Span::styled("● ", marker_style)
+                } else {
+                    Span::raw("  ")
+                };
+
+                let line = Line::from(vec![
+                    Span::styled(if idx == selected { "> " } else { "  " }, row_style),
+                    change_marker,
+                    Span::styled(title, row_style),
+                ]);
                 ListItem::new(line)
             })
             .collect();
@@ -1408,8 +2128,102 @@ impl App {
         frame.render_widget(toc, area);
     }
 
+    fn draw_timeline(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        if self.snapshots.len() <= 1 {
+            let empty = Paragraph::new(" No prior revisions yet")
+                .block(
+                    Block::default()
+                        .title(" Timeline ")
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .padding(Padding::new(1, 1, 0, 0)),
+                )
+                .style(Style::default().fg(Color::Gray));
+            frame.render_widget(empty, area);
+            return;
+        }
+
+        let latest = self.latest_snapshot_index();
+        let items: Vec<ListItem> = self
+            .snapshots
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(idx, snapshot)| {
+                let top = snapshot
+                    .diff
+                    .top_section
+                    .as_ref()
+                    .map(|value| truncate_label(value, 32))
+                    .unwrap_or_else(|| "-".to_string());
+                let row = format!(
+                    "r{:03}  {}  +{}/-{}  h:{}  top:{}{}",
+                    snapshot.revision,
+                    format_clock_hms(snapshot.created_at),
+                    snapshot.diff.added,
+                    snapshot.diff.removed,
+                    snapshot.diff.section_deltas.len(),
+                    top,
+                    if snapshot.diff.overflow {
+                        "  (fallback)"
+                    } else {
+                        ""
+                    }
+                );
+                let line = if idx == self.active_snapshot {
+                    Line::styled(
+                        row,
+                        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                    )
+                } else if idx == latest {
+                    Line::styled(row, Style::default().fg(Color::Cyan))
+                } else {
+                    Line::raw(row)
+                };
+                ListItem::new(line)
+            })
+            .collect();
+
+        let list = List::new(items).block(
+            Block::default()
+                .title(" Timeline ")
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .padding(Padding::new(1, 1, 0, 0)),
+        );
+
+        frame.render_widget(list, area);
+    }
+
     fn draw_content(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let selected_link_line = self.selected_link_line();
+        let total_lines = self.doc.rendered.lines.len();
+        let mut changed_lines = vec![false; total_lines];
+        let mut hunk_anchors = vec![false; total_lines];
+        let freshness = self
+            .current_snapshot()
+            .and_then(|snapshot| change_freshness(snapshot.created_instant));
+
+        if let Some(snapshot) = self.current_snapshot() {
+            for hunk in &snapshot.diff.hunks {
+                if total_lines == 0 {
+                    continue;
+                }
+                let anchor = hunk_anchor_line(hunk, total_lines);
+                hunk_anchors[anchor] = true;
+
+                if freshness.is_some() {
+                    if hunk.end_line > hunk.start_line {
+                        for line in hunk.start_line.min(total_lines)..hunk.end_line.min(total_lines)
+                        {
+                            changed_lines[line] = true;
+                        }
+                    } else {
+                        changed_lines[anchor] = true;
+                    }
+                }
+            }
+        }
 
         let lines: Vec<Line> = self
             .doc
@@ -1420,24 +2234,44 @@ impl App {
             .map(|(idx, line)| {
                 let is_match = self.search_matches.binary_search(&idx).is_ok();
                 let is_selected_link_line = selected_link_line == Some(idx);
+                let is_changed = changed_lines.get(idx).copied().unwrap_or(false);
+                let is_hunk_anchor = hunk_anchors.get(idx).copied().unwrap_or(false);
 
-                let spans = if line.segments.is_empty() {
-                    vec![Span::raw("")]
-                } else {
-                    line.segments
-                        .iter()
-                        .map(|segment| {
-                            let mut style = segment.style;
-                            if is_match {
-                                style = style.bg(Color::Rgb(40, 40, 40));
-                            }
-                            if is_selected_link_line {
-                                style = style.bg(Color::Blue).fg(Color::White);
-                            }
-                            Span::styled(segment.text.clone(), style)
-                        })
-                        .collect()
+                let base_marker_style = match freshness {
+                    Some(ChangeFreshness::Bright) => Style::default()
+                        .fg(Color::LightRed)
+                        .add_modifier(Modifier::BOLD),
+                    Some(ChangeFreshness::Dim) => Style::default().fg(Color::Gray),
+                    None => Style::default().fg(Color::LightBlue),
                 };
+                let marker_span = if is_hunk_anchor {
+                    Span::styled("▌ ", base_marker_style)
+                } else {
+                    Span::styled("  ", Style::default())
+                };
+
+                let mut spans = vec![marker_span];
+                if line.segments.is_empty() {
+                    spans.push(Span::raw(""));
+                } else {
+                    spans.extend(line.segments.iter().map(|segment| {
+                        let mut style = segment.style;
+                        if is_changed {
+                            style = match freshness {
+                                Some(ChangeFreshness::Bright) => style.bg(Color::Rgb(70, 35, 0)),
+                                Some(ChangeFreshness::Dim) => style.bg(Color::Rgb(36, 36, 36)),
+                                None => style,
+                            };
+                        }
+                        if is_match {
+                            style = style.bg(Color::Rgb(40, 40, 40));
+                        }
+                        if is_selected_link_line {
+                            style = style.bg(Color::Blue).fg(Color::White);
+                        }
+                        Span::styled(segment.text.clone(), style)
+                    }));
+                }
                 Line::from(spans)
             })
             .collect();
@@ -1496,15 +2330,48 @@ impl App {
             )
         };
 
-        let watch_hint = if self.cli.watch { " watch:on" } else { "" };
-
-        let status_text = if self.status.is_empty() {
-            format!("{path} | {link_hint}{search_hint}{watch_hint}")
+        let mode_hint = if self.cli.watch {
+            if let Some(snapshot) = self.current_snapshot() {
+                let behind = self
+                    .latest_snapshot_index()
+                    .saturating_sub(self.active_snapshot);
+                if behind == 0 {
+                    format!(
+                        "LIVE r{:03} | +{}/-{} | sections:{} | watch:on",
+                        snapshot.revision,
+                        snapshot.diff.added,
+                        snapshot.diff.removed,
+                        snapshot.diff.section_deltas.len()
+                    )
+                } else {
+                    format!(
+                        "HISTORY r{:03} ({behind} behind LIVE) | +{}/-{} | hunks:{}",
+                        snapshot.revision,
+                        snapshot.diff.added,
+                        snapshot.diff.removed,
+                        snapshot.diff.hunks.len()
+                    )
+                }
+            } else {
+                "watch:on".to_string()
+            }
         } else {
-            format!(
-                "{path} | {link_hint}{search_hint}{watch_hint} | {}",
-                self.status
-            )
+            String::new()
+        };
+
+        let mut parts = Vec::new();
+        if !mode_hint.is_empty() {
+            parts.push(mode_hint);
+        }
+        parts.push(path);
+        parts.push(format!("{link_hint}{search_hint}"));
+        if !self.status.is_empty() {
+            parts.push(self.status.clone());
+        }
+        let status_text = if parts.is_empty() {
+            String::new()
+        } else {
+            parts.join(" | ")
         };
 
         frame.render_widget(
@@ -1544,6 +2411,24 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('v') => {
+                self.toggle_timeline();
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.move_revision_relative(true);
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.move_revision_relative(false);
+            }
+            KeyCode::Char('L') => {
+                self.jump_to_live_revision();
+            }
+            KeyCode::Char('(') => {
+                self.jump_hunk_relative(true);
+            }
+            KeyCode::Char(')') => {
+                self.jump_hunk_relative(false);
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.toc_open {
                     self.move_toc_selection(false);
@@ -1709,4 +2594,87 @@ fn main() -> Result<()> {
 
     let app = App::new(cli, load, rendered, syntax_set, theme);
     run_interactive(app)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_doc(lines: &[&str], toc: &[(u8, &str, usize)]) -> RenderedDocument {
+        RenderedDocument {
+            lines: lines
+                .iter()
+                .map(|line| RenderedLine {
+                    segments: Vec::new(),
+                    plain: (*line).to_string(),
+                })
+                .collect(),
+            toc: toc
+                .iter()
+                .map(|(level, title, line)| TocEntry {
+                    level: *level,
+                    title: (*title).to_string(),
+                    line: *line,
+                })
+                .collect(),
+            links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compute_line_diff_detects_insert_hunk() {
+        let old_lines = vec!["a", "b", "c"];
+        let new_lines = vec!["a", "b", "x", "c"];
+        let diff = compute_line_diff(&old_lines, &new_lines, 1_000);
+
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 0);
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.hunks[0].start_line, 2);
+        assert_eq!(diff.hunks[0].end_line, 3);
+    }
+
+    #[test]
+    fn compute_line_diff_detects_replacement_hunk() {
+        let old_lines = vec!["a", "b", "c"];
+        let new_lines = vec!["a", "z", "c"];
+        let diff = compute_line_diff(&old_lines, &new_lines, 1_000);
+
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.hunks[0].start_line, 1);
+        assert_eq!(diff.hunks[0].end_line, 2);
+    }
+
+    #[test]
+    fn build_snapshot_diff_maps_changed_section() {
+        let old_doc = test_doc(
+            &["# Intro", "", "hello", "## Details", "", "world"],
+            &[(1, "Intro", 0), (2, "Details", 3)],
+        );
+        let new_doc = test_doc(
+            &["# Intro", "", "hello", "## Details", "", "planet"],
+            &[(1, "Intro", 0), (2, "Details", 3)],
+        );
+        let diff = build_snapshot_diff(&old_doc, &new_doc);
+
+        assert_eq!(diff.section_deltas.len(), 1);
+        assert!(diff.section_deltas.contains_key(&1));
+        assert_eq!(diff.top_section.as_deref(), Some("Details"));
+    }
+
+    #[test]
+    fn compute_line_diff_falls_back_for_large_matrix() {
+        let old_lines: Vec<String> = (0..60).map(|idx| format!("a{idx}")).collect();
+        let new_lines: Vec<String> = (0..60).map(|idx| format!("b{idx}")).collect();
+        let old_refs: Vec<&str> = old_lines.iter().map(|line| line.as_str()).collect();
+        let new_refs: Vec<&str> = new_lines.iter().map(|line| line.as_str()).collect();
+
+        let diff = compute_line_diff(&old_refs, &new_refs, 100);
+        assert!(diff.overflow);
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.added, 60);
+        assert_eq!(diff.removed, 60);
+    }
 }

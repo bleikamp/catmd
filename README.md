@@ -55,6 +55,9 @@ catmd notes.md --plain
 
 # Auto-reload when file changes
 catmd notes.md --watch
+
+# Keep up to 200 in-memory watch snapshots
+catmd notes.md --watch --history 200
 ```
 
 ### Input behavior
@@ -79,6 +82,10 @@ catmd notes.md --watch
 - `Enter`: open selected link (when TOC is closed)
 - `o`: open selected link externally (browser/system opener)
 - `Backspace`: go back in local markdown backstack
+- `v`: toggle timeline dock (watch mode)
+- `h` / `l` or `Left` / `Right`: older/newer revision (watch mode)
+- `L`: jump back to live/latest revision (watch mode)
+- `(` / `)`: previous/next changed hunk (watch mode)
 - `q`: quit
 
 ## Link behavior
@@ -102,6 +109,9 @@ Images render as placeholders with alt text and path:
 - scroll position is preserved when possible
 - TOC and links refresh after reload
 - watch mode is only available for file input
+- in-memory revision history is kept with `--history <N>` (default `50`)
+- timeline dock shows revision id, timestamp, `+/-` summary, touched section count, and top changed section
+- status bar shows `LIVE` vs `HISTORY` mode
 
 ## Roadmap
 
