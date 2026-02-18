@@ -30,6 +30,8 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+const NO_TOC_HEADINGS_STATUS: &str = "No headings in TOC";
+
 fn system_open<S: AsRef<OsStr>>(arg: S) -> Result<()> {
     #[cfg(target_os = "macos")]
     let status = Command::new("open").arg(arg).status()?;
@@ -59,6 +61,13 @@ fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
         y,
         width,
         height,
+    }
+}
+
+fn usize_to_u16_saturating(value: usize) -> u16 {
+    match u16::try_from(value) {
+        Ok(v) => v,
+        Err(_) => u16::MAX,
     }
 }
 
@@ -324,12 +333,7 @@ impl<'a> Renderer<'a> {
     }
 
     fn blank_line(&mut self) {
-        if self
-            .lines
-            .last()
-            .map(|line| line.plain.is_empty())
-            .unwrap_or(false)
-        {
+        if self.lines.last().is_some_and(|line| line.plain.is_empty()) {
             return;
         }
         self.flush_line(true);
@@ -368,7 +372,6 @@ impl<'a> Renderer<'a> {
         }
 
         match tag {
-            Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
                 self.flush_line(false);
                 self.heading_level = Some(Self::heading_level_u8(level));
@@ -425,7 +428,7 @@ impl<'a> Renderer<'a> {
             Tag::Emphasis => self.inline.emphasis = self.inline.emphasis.saturating_add(1),
             Tag::Strong => self.inline.strong = self.inline.strong.saturating_add(1),
             Tag::Strikethrough => {
-                self.inline.strikethrough = self.inline.strikethrough.saturating_add(1)
+                self.inline.strikethrough = self.inline.strikethrough.saturating_add(1);
             }
             Tag::Link { dest_url, .. } => {
                 self.inline.link_depth = self.inline.link_depth.saturating_add(1);
@@ -444,9 +447,6 @@ impl<'a> Renderer<'a> {
                 self.flush_line(false);
                 self.table = Some(TableState::new(alignments));
             }
-            Tag::TableHead => {}
-            Tag::TableRow => {}
-            Tag::TableCell => {}
             _ => {}
         }
     }
@@ -482,7 +482,7 @@ impl<'a> Renderer<'a> {
                 }
                 TagEnd::Table => {
                     let table_state = self.table.take().unwrap_or_default();
-                    self.render_table(table_state);
+                    self.render_table(&table_state);
                     self.blank_line();
                     return;
                 }
@@ -537,7 +537,7 @@ impl<'a> Renderer<'a> {
             TagEnd::Emphasis => self.inline.emphasis = self.inline.emphasis.saturating_sub(1),
             TagEnd::Strong => self.inline.strong = self.inline.strong.saturating_sub(1),
             TagEnd::Strikethrough => {
-                self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1)
+                self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1);
             }
             TagEnd::Link => {
                 self.inline.link_depth = self.inline.link_depth.saturating_sub(1);
@@ -681,14 +681,14 @@ impl<'a> Renderer<'a> {
 
             self.push_text("  ", Style::default().fg(Color::DarkGray));
 
-            let highlighted = highlighter
+            let highlighted_tokens = highlighter
                 .highlight_line(line, self.syntax_set)
                 .unwrap_or_default();
 
-            if highlighted.is_empty() {
+            if highlighted_tokens.is_empty() {
                 self.push_text(clean, Style::default().fg(Color::LightGreen));
             } else {
-                for (syn_style, token) in highlighted {
+                for (syn_style, token) in highlighted_tokens {
                     let style = Style::default()
                         .fg(Color::Rgb(
                             syn_style.foreground.r,
@@ -709,7 +709,7 @@ impl<'a> Renderer<'a> {
         }
     }
 
-    fn render_table(&mut self, table: TableState) {
+    fn render_table(&mut self, table: &TableState) {
         let mut rows: Vec<Vec<String>> = Vec::new();
         if !table.headers.is_empty() {
             rows.push(table.headers.clone());
@@ -720,7 +720,7 @@ impl<'a> Renderer<'a> {
             return;
         }
 
-        let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
         if col_count == 0 {
             return;
         }
@@ -739,7 +739,7 @@ impl<'a> Renderer<'a> {
         }
 
         if let Some(header) = rows.first() {
-            let line = self.format_table_row(header, &widths, true);
+            let line = Self::format_table_row(header, &widths);
             self.push_text(&line, Style::default().fg(Color::Yellow));
             self.flush_line(false);
 
@@ -764,27 +764,23 @@ impl<'a> Renderer<'a> {
                 };
                 sep_cells.push(sep);
             }
-            let sep_line = self.format_table_row(&sep_cells, &widths, false);
+            let sep_line = Self::format_table_row(&sep_cells, &widths);
             self.push_text(&sep_line, Style::default().fg(Color::DarkGray));
             self.flush_line(false);
 
             for row in rows.iter().skip(1) {
-                let row_line = self.format_table_row(row, &widths, false);
+                let row_line = Self::format_table_row(row, &widths);
                 self.push_text(&row_line, Style::default());
                 self.flush_line(false);
             }
         }
     }
 
-    fn format_table_row(&self, row: &[String], widths: &[usize], is_header: bool) -> String {
+    fn format_table_row(row: &[String], widths: &[usize]) -> String {
         let mut output = String::from("| ");
         for (idx, cell) in row.iter().enumerate() {
             let width = widths[idx];
-            let padded = if is_header {
-                format!("{cell:<width$}")
-            } else {
-                format!("{cell:<width$}")
-            };
+            let padded = format!("{cell:<width$}");
             output.push_str(&padded);
             output.push_str(" | ");
         }
@@ -947,7 +943,7 @@ fn classify_link(target: &str, current_doc: Option<&Path>) -> LinkAction {
     let ext = resolved
         .extension()
         .and_then(|s| s.to_str())
-        .map(|s| s.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
 
     if matches!(ext.as_deref(), Some("md" | "markdown" | "mdx")) {
         return LinkAction::InternalMarkdown(resolved);
@@ -1025,7 +1021,16 @@ impl App {
     fn max_scroll(&self) -> u16 {
         let total = self.doc.rendered.lines.len();
         let visible = self.viewport_height.max(1) as usize;
-        total.saturating_sub(visible) as u16
+        usize_to_u16_saturating(total.saturating_sub(visible))
+    }
+
+    fn set_scroll_and_sync(&mut self, scroll: u16) {
+        self.scroll = scroll.min(self.max_scroll());
+        self.sync_toc_selected_with_scroll();
+    }
+
+    fn set_scroll_to_line(&mut self, line: usize) {
+        self.set_scroll_and_sync(usize_to_u16_saturating(line));
     }
 
     fn clamp_scroll(&mut self) {
@@ -1044,7 +1049,7 @@ impl App {
             .rendered
             .toc
             .iter()
-            .rposition(|entry| entry.line <= self.scroll as usize)
+            .rposition(|entry| entry.line <= usize::from(self.scroll))
             .unwrap_or(0);
     }
 
@@ -1052,7 +1057,7 @@ impl App {
         let len = self.doc.rendered.toc.len();
         if len == 0 {
             self.toc_selected = 0;
-            self.status = "No headings in TOC".to_string();
+            self.status = NO_TOC_HEADINGS_STATUS.to_string();
             return;
         }
         if reverse {
@@ -1063,12 +1068,18 @@ impl App {
     }
 
     fn jump_to_toc_index(&mut self, index: usize) {
-        if let Some(entry) = self.doc.rendered.toc.get(index) {
+        if let Some((line, title)) = self
+            .doc
+            .rendered
+            .toc
+            .get(index)
+            .map(|entry| (entry.line, entry.title.clone()))
+        {
             self.toc_selected = index;
-            self.scroll = (entry.line as u16).min(self.max_scroll());
-            self.status = format!("Jumped to {}", entry.title);
+            self.set_scroll_to_line(line);
+            self.status = format!("Jumped to {title}");
         } else {
-            self.status = "No headings in TOC".to_string();
+            self.status = NO_TOC_HEADINGS_STATUS.to_string();
         }
     }
 
@@ -1079,24 +1090,22 @@ impl App {
     fn jump_heading_relative(&mut self, reverse: bool) {
         let toc = &self.doc.rendered.toc;
         if toc.is_empty() {
-            self.status = "No headings in TOC".to_string();
+            self.status = NO_TOC_HEADINGS_STATUS.to_string();
             return;
         }
 
-        let line = self.scroll as usize;
+        let line = usize::from(self.scroll);
         let target_index = if reverse {
             toc.iter()
                 .enumerate()
                 .rev()
                 .find(|(_, entry)| entry.line < line)
-                .map(|(idx, _)| idx)
-                .unwrap_or(0)
+                .map_or(0, |(idx, _)| idx)
         } else {
             toc.iter()
                 .enumerate()
                 .find(|(_, entry)| entry.line > line)
-                .map(|(idx, _)| idx)
-                .unwrap_or_else(|| toc.len().saturating_sub(1))
+                .map_or_else(|| toc.len().saturating_sub(1), |(idx, _)| idx)
         };
 
         self.jump_to_toc_index(target_index);
@@ -1133,8 +1142,7 @@ impl App {
         self.current_match = self
             .current_match
             .min(self.search_matches.len().saturating_sub(1));
-        let target = self.search_matches[self.current_match] as u16;
-        self.scroll = target.min(self.max_scroll());
+        self.set_scroll_to_line(self.search_matches[self.current_match]);
     }
 
     fn jump_to_next_match(&mut self, reverse: bool) {
@@ -1151,7 +1159,7 @@ impl App {
         } else {
             self.current_match = (self.current_match + 1) % self.search_matches.len();
         }
-        self.scroll = (self.search_matches[self.current_match] as u16).min(self.max_scroll());
+        self.set_scroll_to_line(self.search_matches[self.current_match]);
     }
 
     fn cycle_link(&mut self, reverse: bool) {
@@ -1173,7 +1181,7 @@ impl App {
         };
         self.selected_link = Some(next);
         if let Some(line) = self.selected_link_line() {
-            self.scroll = (line as u16).min(self.max_scroll());
+            self.set_scroll_to_line(line);
         }
     }
 
@@ -1203,9 +1211,7 @@ impl App {
     }
 
     fn reload_current(&mut self) -> Result<()> {
-        let path = if let Some(path) = self.doc.path.clone() {
-            path
-        } else {
+        let Some(path) = self.doc.path.clone() else {
             return Ok(());
         };
 
@@ -1227,9 +1233,7 @@ impl App {
             return Ok(());
         }
 
-        let path = if let Some(path) = self.doc.path.clone() {
-            path
-        } else {
+        let Some(path) = self.doc.path.clone() else {
             self.watcher = None;
             return Ok(());
         };
@@ -1261,9 +1265,7 @@ impl App {
     }
 
     fn open_selected_link(&mut self, force_external: bool) -> Result<()> {
-        let link_idx = if let Some(idx) = self.selected_link {
-            idx
-        } else {
+        let Some(link_idx) = self.selected_link else {
             self.status = "No link selected".to_string();
             return Ok(());
         };
@@ -1337,8 +1339,7 @@ impl App {
             },
             false,
         );
-        self.scroll = entry.scroll.min(self.max_scroll());
-        self.sync_toc_selected_with_scroll();
+        self.set_scroll_and_sync(entry.scroll);
         self.ensure_watcher()?;
         self.status = format!("Returned to {}", entry.path.display());
         Ok(())
@@ -1350,8 +1351,7 @@ impl App {
         let body = chunks[0];
         let status = inset_rect(chunks[1], 1, 0);
 
-        let content_area;
-        if self.toc_open {
+        let content_area = if self.toc_open {
             let widths = [
                 Constraint::Length(body.width.saturating_div(3).max(24)),
                 Constraint::Length(1),
@@ -1359,10 +1359,10 @@ impl App {
             ];
             let cols = Layout::horizontal(widths).split(body);
             self.draw_toc(frame, cols[0]);
-            content_area = cols[2];
+            cols[2]
         } else {
-            content_area = body;
-        }
+            body
+        };
 
         self.viewport_height = content_area.height.saturating_sub(1).max(1);
         self.clamp_scroll();
@@ -1461,23 +1461,20 @@ impl App {
             .doc
             .path
             .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<stdin>".to_string());
+            .map_or_else(|| "<stdin>".to_string(), |p| p.display().to_string());
 
         let link_hint = if let Some(idx) = self.selected_link {
-            self.doc
-                .rendered
-                .links
-                .get(idx)
-                .map(|link| {
+            self.doc.rendered.links.get(idx).map_or_else(
+                || "link: none".to_string(),
+                |link| {
                     format!(
                         "link[{}/{}]: {}",
                         idx + 1,
                         self.doc.rendered.links.len(),
                         link.label
                     )
-                })
-                .unwrap_or_else(|| "link: none".to_string())
+                },
+            )
         } else {
             "link: none".to_string()
         };
@@ -1502,11 +1499,11 @@ impl App {
         let watch_hint = if self.cli.watch { " watch:on" } else { "" };
 
         let status_text = if self.status.is_empty() {
-            format!("{} | {}{}{}", path, link_hint, search_hint, watch_hint)
+            format!("{path} | {link_hint}{search_hint}{watch_hint}")
         } else {
             format!(
-                "{} | {}{}{} | {}",
-                path, link_hint, search_hint, watch_hint, self.status
+                "{path} | {link_hint}{search_hint}{watch_hint} | {}",
+                self.status
             )
         };
 
@@ -1518,10 +1515,7 @@ impl App {
 
     fn handle_search_input(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                self.search_mode = false;
-            }
-            KeyCode::Enter => {
+            KeyCode::Esc | KeyCode::Enter => {
                 self.search_mode = false;
             }
             KeyCode::Backspace => {
@@ -1554,35 +1548,29 @@ impl App {
                 if self.toc_open {
                     self.move_toc_selection(false);
                 } else {
-                    self.scroll = self.scroll.saturating_add(1).min(self.max_scroll());
-                    self.sync_toc_selected_with_scroll();
+                    self.set_scroll_and_sync(self.scroll.saturating_add(1));
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if self.toc_open {
                     self.move_toc_selection(true);
                 } else {
-                    self.scroll = self.scroll.saturating_sub(1);
-                    self.sync_toc_selected_with_scroll();
+                    self.set_scroll_and_sync(self.scroll.saturating_sub(1));
                 }
             }
             KeyCode::Char('g') => {
-                self.scroll = 0;
-                self.sync_toc_selected_with_scroll();
+                self.set_scroll_and_sync(0);
             }
             KeyCode::Char('G') => {
-                self.scroll = self.max_scroll();
-                self.sync_toc_selected_with_scroll();
+                self.set_scroll_and_sync(self.max_scroll());
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let delta = self.viewport_height.saturating_div(2).max(1);
-                self.scroll = self.scroll.saturating_add(delta).min(self.max_scroll());
-                self.sync_toc_selected_with_scroll();
+                self.set_scroll_and_sync(self.scroll.saturating_add(delta));
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let delta = self.viewport_height.saturating_div(2).max(1);
-                self.scroll = self.scroll.saturating_sub(delta);
-                self.sync_toc_selected_with_scroll();
+                self.set_scroll_and_sync(self.scroll.saturating_sub(delta));
             }
             KeyCode::Char('t') => {
                 self.toc_open = !self.toc_open;
