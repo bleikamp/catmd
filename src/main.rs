@@ -1,11 +1,9 @@
-use std::collections::{BTreeMap, VecDeque};
-use std::ffi::OsStr;
+use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, IsTerminal, Read};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -15,10 +13,6 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, ExecutableCommand};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event as MdEvent, HeadingLevel, Options, Parser as MdParser, Tag,
-    TagEnd,
-};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::prelude::{Color, Modifier, Rect, Style};
@@ -26,36 +20,30 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::block::Padding;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
-use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
+
+mod diff;
+mod input;
+mod links;
+mod markdown;
+
+use diff::{
+    build_snapshot_diff, change_freshness, format_clock_hms, hunk_anchor_line, truncate_label,
+    ChangeFreshness, SnapshotDiff, WatchSnapshot,
+};
+use input::{default_interactive, detect_input, read_input, Cli, InputSource, LoadResult};
+use links::{classify_link, system_open, LinkAction};
+use markdown::{plain_render, render_markdown, RenderedDocument};
+
+#[cfg(test)]
+use diff::compute_line_diff;
+#[cfg(test)]
+use markdown::{RenderedLine, TocEntry};
 
 const NO_TOC_HEADINGS_STATUS: &str = "No headings in TOC";
 const TIMELINE_DEFAULT_HEIGHT: u16 = 6;
 const TIMELINE_MIN_HEIGHT: u16 = 3;
-const BRIGHT_CHANGE_WINDOW: Duration = Duration::from_secs(2);
-const DIM_CHANGE_WINDOW: Duration = Duration::from_secs(15);
-const DIFF_MAX_CELLS: usize = 2_000_000;
-
-fn system_open<S: AsRef<OsStr>>(arg: S) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg(arg).status()?;
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let status = Command::new("xdg-open").arg(arg).status()?;
-
-    #[cfg(target_os = "windows")]
-    let status = Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(arg)
-        .status()?;
-
-    if !status.success() {
-        return Err(anyhow!("system open command failed with status {status}"));
-    }
-    Ok(())
-}
 
 fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
     let x = area.x.saturating_add(horizontal);
@@ -77,74 +65,16 @@ fn usize_to_u16_saturating(value: usize) -> u16 {
     }
 }
 
-fn parse_history(value: &str) -> std::result::Result<usize, String> {
-    let parsed: usize = value
-        .parse()
-        .map_err(|_| "--history must be a positive integer".to_string())?;
-    if parsed == 0 {
-        return Err("--history must be at least 1".to_string());
+fn resolve_theme(theme_set: &ThemeSet) -> Theme {
+    if let Some(theme) = theme_set.themes.get("base16-ocean.dark") {
+        return theme.clone();
     }
-    Ok(parsed)
-}
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "catmd",
-    version,
-    about = "Render markdown for terminal workflows"
-)]
-struct Cli {
-    /// Markdown file path. Use '-' to read from stdin.
-    input: Option<String>,
-
-    /// Force interactive pager mode.
-    #[arg(short, long)]
-    interactive: bool,
-
-    /// Force plain stdout rendering.
-    #[arg(long)]
-    plain: bool,
-
-    /// Reload when the file changes (file input only).
-    #[arg(long)]
-    watch: bool,
-
-    /// Number of in-memory snapshots to keep while watching.
-    #[arg(long, default_value_t = 50, value_parser = parse_history)]
-    history: usize,
-}
-
-#[derive(Clone, Debug)]
-struct StyledSegment {
-    text: String,
-    style: Style,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RenderedLine {
-    segments: Vec<StyledSegment>,
-    plain: String,
-}
-
-#[derive(Clone, Debug)]
-struct LinkRef {
-    label: String,
-    target: String,
-    line: usize,
-}
-
-#[derive(Clone, Debug)]
-struct TocEntry {
-    level: u8,
-    title: String,
-    line: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RenderedDocument {
-    lines: Vec<RenderedLine>,
-    toc: Vec<TocEntry>,
-    links: Vec<LinkRef>,
+    theme_set
+        .themes
+        .values()
+        .next()
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -159,1182 +89,9 @@ struct HistoryEntry {
     scroll: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct SectionDelta {
-    added: usize,
-    removed: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct DiffHunk {
-    start_line: usize,
-    end_line: usize,
-    added: usize,
-    removed: usize,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SnapshotDiff {
-    added: usize,
-    removed: usize,
-    hunks: Vec<DiffHunk>,
-    section_deltas: BTreeMap<usize, SectionDelta>,
-    top_section: Option<String>,
-    overflow: bool,
-}
-
-#[derive(Clone, Debug)]
-struct WatchSnapshot {
-    revision: u64,
-    created_at: SystemTime,
-    created_instant: Instant,
-    rendered: RenderedDocument,
-    diff: SnapshotDiff,
-}
-
 struct FileWatcher {
     _watcher: RecommendedWatcher,
     rx: Receiver<notify::Result<Event>>,
-}
-
-#[derive(Clone)]
-struct ActiveLink {
-    target: String,
-    text: String,
-}
-
-#[derive(Clone)]
-struct ActiveImage {
-    target: String,
-    alt: String,
-}
-
-#[derive(Default)]
-struct TableState {
-    in_head: bool,
-    in_row: bool,
-    in_cell: bool,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-    current_row: Vec<String>,
-    current_cell: String,
-    alignments: Vec<Alignment>,
-}
-
-impl TableState {
-    fn new(alignments: Vec<Alignment>) -> Self {
-        Self {
-            alignments,
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Default)]
-struct InlineState {
-    emphasis: usize,
-    strong: usize,
-    strikethrough: usize,
-    link_depth: usize,
-}
-
-impl InlineState {
-    fn style(&self) -> Style {
-        let mut style = Style::default();
-        if self.emphasis > 0 {
-            style = style.add_modifier(Modifier::ITALIC);
-        }
-        if self.strong > 0 {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        if self.strikethrough > 0 {
-            style = style.add_modifier(Modifier::CROSSED_OUT);
-        }
-        if self.link_depth > 0 {
-            style = style.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
-        }
-        style
-    }
-}
-
-struct Renderer<'a> {
-    syntax_set: &'a SyntaxSet,
-    theme: &'a Theme,
-
-    lines: Vec<RenderedLine>,
-    toc: Vec<TocEntry>,
-    links: Vec<LinkRef>,
-
-    inline: InlineState,
-    current_segments: Vec<StyledSegment>,
-    current_plain: String,
-    current_line_link_indices: Vec<usize>,
-
-    active_link: Option<ActiveLink>,
-    active_image: Option<ActiveImage>,
-
-    heading_level: Option<u8>,
-    blockquote_depth: usize,
-    list_stack: Vec<ListState>,
-
-    code_block_lang: Option<String>,
-    code_block_buf: String,
-
-    table: Option<TableState>,
-}
-
-#[derive(Clone, Debug)]
-struct ListState {
-    ordered: bool,
-    next_index: u64,
-}
-
-impl<'a> Renderer<'a> {
-    fn new(syntax_set: &'a SyntaxSet, theme: &'a Theme) -> Self {
-        Self {
-            syntax_set,
-            theme,
-            lines: Vec::new(),
-            toc: Vec::new(),
-            links: Vec::new(),
-            inline: InlineState::default(),
-            current_segments: Vec::new(),
-            current_plain: String::new(),
-            current_line_link_indices: Vec::new(),
-            active_link: None,
-            active_image: None,
-            heading_level: None,
-            blockquote_depth: 0,
-            list_stack: Vec::new(),
-            code_block_lang: None,
-            code_block_buf: String::new(),
-            table: None,
-        }
-    }
-
-    fn finish(mut self) -> RenderedDocument {
-        self.flush_line(false);
-        if self.lines.is_empty() {
-            self.lines.push(RenderedLine::default());
-        }
-        RenderedDocument {
-            lines: self.lines,
-            toc: self.toc,
-            links: self.links,
-        }
-    }
-
-    fn push_text(&mut self, text: &str, style: Style) {
-        if text.is_empty() {
-            return;
-        }
-        self.current_plain.push_str(text);
-        self.current_segments.push(StyledSegment {
-            text: text.to_string(),
-            style,
-        });
-    }
-
-    fn push_styled_plain_text(&mut self, text: &str) {
-        let style = if let Some(level) = self.heading_level {
-            match level {
-                1 => Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-                2 => Style::default()
-                    .fg(Color::LightMagenta)
-                    .add_modifier(Modifier::BOLD),
-                _ => Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-            }
-        } else {
-            self.inline.style()
-        };
-        self.push_text(text, style);
-    }
-
-    fn push_prefix_if_needed(&mut self) {
-        if !self.current_plain.is_empty() {
-            return;
-        }
-
-        if self.blockquote_depth > 0 {
-            let prefix = "> ".repeat(self.blockquote_depth);
-            self.push_text(&prefix, Style::default().fg(Color::DarkGray));
-        }
-    }
-
-    fn flush_line(&mut self, force_empty: bool) {
-        if !force_empty && self.current_segments.is_empty() && self.current_plain.is_empty() {
-            return;
-        }
-
-        let line_index = self.lines.len();
-        for idx in &self.current_line_link_indices {
-            if let Some(link) = self.links.get_mut(*idx) {
-                link.line = line_index;
-            }
-        }
-
-        let line = RenderedLine {
-            segments: std::mem::take(&mut self.current_segments),
-            plain: std::mem::take(&mut self.current_plain),
-        };
-        self.current_line_link_indices.clear();
-        self.lines.push(line);
-    }
-
-    fn blank_line(&mut self) {
-        if self.lines.last().is_some_and(|line| line.plain.is_empty()) {
-            return;
-        }
-        self.flush_line(true);
-    }
-
-    fn heading_level_u8(level: HeadingLevel) -> u8 {
-        match level {
-            HeadingLevel::H1 => 1,
-            HeadingLevel::H2 => 2,
-            HeadingLevel::H3 => 3,
-            HeadingLevel::H4 => 4,
-            HeadingLevel::H5 => 5,
-            HeadingLevel::H6 => 6,
-        }
-    }
-
-    fn handle_start(&mut self, tag: Tag<'_>) {
-        if let Some(table) = self.table.as_mut() {
-            match tag {
-                Tag::TableHead => {
-                    table.in_head = true;
-                    return;
-                }
-                Tag::TableRow => {
-                    table.in_row = true;
-                    table.current_row.clear();
-                    return;
-                }
-                Tag::TableCell => {
-                    table.in_cell = true;
-                    table.current_cell.clear();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        match tag {
-            Tag::Heading { level, .. } => {
-                self.flush_line(false);
-                self.heading_level = Some(Self::heading_level_u8(level));
-            }
-            Tag::BlockQuote(_) => {
-                self.flush_line(false);
-                self.blockquote_depth = self.blockquote_depth.saturating_add(1);
-            }
-            Tag::CodeBlock(kind) => {
-                self.flush_line(false);
-                let lang = match kind {
-                    CodeBlockKind::Fenced(name) => name.to_string(),
-                    CodeBlockKind::Indented => String::new(),
-                };
-                self.code_block_lang = Some(lang);
-                self.code_block_buf.clear();
-            }
-            Tag::List(start) => {
-                let list = if let Some(index) = start {
-                    ListState {
-                        ordered: true,
-                        next_index: index,
-                    }
-                } else {
-                    ListState {
-                        ordered: false,
-                        next_index: 1,
-                    }
-                };
-                self.list_stack.push(list);
-            }
-            Tag::Item => {
-                self.flush_line(false);
-                let depth = self.list_stack.len().saturating_sub(1);
-                let indent = "  ".repeat(depth);
-
-                let bullet = if let Some(last) = self.list_stack.last_mut() {
-                    if last.ordered {
-                        let bullet = format!("{}. ", last.next_index);
-                        last.next_index = last.next_index.saturating_add(1);
-                        bullet
-                    } else {
-                        "- ".to_string()
-                    }
-                } else {
-                    "- ".to_string()
-                };
-
-                self.push_text(
-                    &format!("{indent}{bullet}"),
-                    Style::default().fg(Color::DarkGray),
-                );
-            }
-            Tag::Emphasis => self.inline.emphasis = self.inline.emphasis.saturating_add(1),
-            Tag::Strong => self.inline.strong = self.inline.strong.saturating_add(1),
-            Tag::Strikethrough => {
-                self.inline.strikethrough = self.inline.strikethrough.saturating_add(1);
-            }
-            Tag::Link { dest_url, .. } => {
-                self.inline.link_depth = self.inline.link_depth.saturating_add(1);
-                self.active_link = Some(ActiveLink {
-                    target: dest_url.to_string(),
-                    text: String::new(),
-                });
-            }
-            Tag::Image { dest_url, .. } => {
-                self.active_image = Some(ActiveImage {
-                    target: dest_url.to_string(),
-                    alt: String::new(),
-                });
-            }
-            Tag::Table(alignments) => {
-                self.flush_line(false);
-                self.table = Some(TableState::new(alignments));
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_end(&mut self, tag: TagEnd) {
-        if let Some(table) = self.table.as_mut() {
-            match tag {
-                TagEnd::TableCell => {
-                    if table.in_cell {
-                        table
-                            .current_row
-                            .push(table.current_cell.trim().to_string());
-                        table.current_cell.clear();
-                        table.in_cell = false;
-                    }
-                    return;
-                }
-                TagEnd::TableRow => {
-                    if table.in_row {
-                        if table.in_head {
-                            table.headers = table.current_row.clone();
-                        } else {
-                            table.rows.push(table.current_row.clone());
-                        }
-                        table.current_row.clear();
-                        table.in_row = false;
-                    }
-                    return;
-                }
-                TagEnd::TableHead => {
-                    table.in_head = false;
-                    return;
-                }
-                TagEnd::Table => {
-                    let table_state = self.table.take().unwrap_or_default();
-                    self.render_table(&table_state);
-                    self.blank_line();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        match tag {
-            TagEnd::Paragraph => {
-                self.flush_line(false);
-                self.blank_line();
-            }
-            TagEnd::Heading(level) => {
-                self.flush_line(false);
-                let line_idx = self.lines.len().saturating_sub(1);
-                let title = self
-                    .lines
-                    .get(line_idx)
-                    .map(|line| line.plain.trim().to_string())
-                    .unwrap_or_default();
-
-                let level_u8 = Self::heading_level_u8(level);
-                if level_u8 <= 3 && !title.is_empty() {
-                    self.toc.push(TocEntry {
-                        level: level_u8,
-                        title,
-                        line: line_idx,
-                    });
-                }
-                self.heading_level = None;
-                self.blank_line();
-            }
-            TagEnd::BlockQuote => {
-                self.flush_line(false);
-                self.blockquote_depth = self.blockquote_depth.saturating_sub(1);
-                self.blank_line();
-            }
-            TagEnd::CodeBlock => {
-                let lang = self.code_block_lang.take().unwrap_or_default();
-                let code = std::mem::take(&mut self.code_block_buf);
-                self.render_code_block(&lang, &code);
-                self.blank_line();
-            }
-            TagEnd::List(_) => {
-                self.flush_line(false);
-                self.list_stack.pop();
-                self.blank_line();
-            }
-            TagEnd::Item => {
-                self.flush_line(false);
-            }
-            TagEnd::Emphasis => self.inline.emphasis = self.inline.emphasis.saturating_sub(1),
-            TagEnd::Strong => self.inline.strong = self.inline.strong.saturating_sub(1),
-            TagEnd::Strikethrough => {
-                self.inline.strikethrough = self.inline.strikethrough.saturating_sub(1);
-            }
-            TagEnd::Link => {
-                self.inline.link_depth = self.inline.link_depth.saturating_sub(1);
-                if let Some(link) = self.active_link.take() {
-                    let link_ref = LinkRef {
-                        label: if link.text.trim().is_empty() {
-                            link.target.clone()
-                        } else {
-                            link.text.trim().to_string()
-                        },
-                        target: link.target,
-                        line: usize::MAX,
-                    };
-                    let index = self.links.len();
-                    self.links.push(link_ref);
-                    self.current_line_link_indices.push(index);
-                }
-            }
-            TagEnd::Image => {
-                if let Some(image) = self.active_image.take() {
-                    let alt = if image.alt.trim().is_empty() {
-                        "image".to_string()
-                    } else {
-                        image.alt.trim().to_string()
-                    };
-                    let placeholder = format!("[image: {alt}] ({})", image.target);
-                    self.push_text(&placeholder, Style::default().fg(Color::LightBlue));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn add_text(&mut self, text: &str) {
-        if self.code_block_lang.is_some() {
-            self.code_block_buf.push_str(text);
-            return;
-        }
-
-        if let Some(table) = self.table.as_mut() {
-            if table.in_cell {
-                table.current_cell.push_str(text);
-                return;
-            }
-        }
-
-        if let Some(image) = self.active_image.as_mut() {
-            image.alt.push_str(text);
-            return;
-        }
-
-        self.push_prefix_if_needed();
-        self.push_styled_plain_text(text);
-        if let Some(link) = self.active_link.as_mut() {
-            link.text.push_str(text);
-        }
-    }
-
-    fn soft_break(&mut self) {
-        if self.code_block_lang.is_some() {
-            self.code_block_buf.push('\n');
-            return;
-        }
-        if let Some(table) = self.table.as_mut() {
-            if table.in_cell {
-                table.current_cell.push(' ');
-                return;
-            }
-        }
-
-        self.push_text(" ", self.inline.style());
-        if let Some(link) = self.active_link.as_mut() {
-            link.text.push(' ');
-        }
-    }
-
-    fn hard_break(&mut self) {
-        if self.code_block_lang.is_some() {
-            self.code_block_buf.push('\n');
-            return;
-        }
-        self.flush_line(false);
-    }
-
-    fn add_inline_code(&mut self, code: &str) {
-        if self.code_block_lang.is_some() {
-            self.code_block_buf.push_str(code);
-            return;
-        }
-        if let Some(table) = self.table.as_mut() {
-            if table.in_cell {
-                table.current_cell.push_str(code);
-                return;
-            }
-        }
-        self.push_prefix_if_needed();
-        let style = Style::default()
-            .fg(Color::LightYellow)
-            .add_modifier(Modifier::BOLD);
-        self.push_text(code, style);
-        if let Some(link) = self.active_link.as_mut() {
-            link.text.push_str(code);
-        }
-    }
-
-    fn add_rule(&mut self) {
-        self.flush_line(false);
-        self.push_text(
-            "────────────────────────────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
-        );
-        self.flush_line(false);
-        self.blank_line();
-    }
-
-    fn add_task_marker(&mut self, done: bool) {
-        self.push_prefix_if_needed();
-        let marker = if done { "[x] " } else { "[ ] " };
-        self.push_text(marker, Style::default().fg(Color::DarkGray));
-    }
-
-    fn render_code_block(&mut self, lang: &str, code: &str) {
-        let syntax = if lang.trim().is_empty() {
-            self.syntax_set.find_syntax_plain_text()
-        } else {
-            self.syntax_set
-                .find_syntax_by_token(lang)
-                .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
-        };
-
-        let mut highlighter = HighlightLines::new(syntax, self.theme);
-
-        for line in LinesWithEndings::from(code) {
-            let mut clean = line;
-            if let Some(trimmed) = clean.strip_suffix('\n') {
-                clean = trimmed;
-            }
-            if let Some(trimmed) = clean.strip_suffix('\r') {
-                clean = trimmed;
-            }
-
-            self.push_text("  ", Style::default().fg(Color::DarkGray));
-
-            let highlighted_tokens = highlighter
-                .highlight_line(line, self.syntax_set)
-                .unwrap_or_default();
-
-            if highlighted_tokens.is_empty() {
-                self.push_text(clean, Style::default().fg(Color::LightGreen));
-            } else {
-                for (syn_style, token) in highlighted_tokens {
-                    let style = Style::default()
-                        .fg(Color::Rgb(
-                            syn_style.foreground.r,
-                            syn_style.foreground.g,
-                            syn_style.foreground.b,
-                        ))
-                        .bg(Color::Rgb(
-                            syn_style.background.r,
-                            syn_style.background.g,
-                            syn_style.background.b,
-                        ));
-                    let token = token.replace('\n', "");
-                    self.push_text(&token, style);
-                }
-            }
-
-            self.flush_line(false);
-        }
-    }
-
-    fn render_table(&mut self, table: &TableState) {
-        let mut rows: Vec<Vec<String>> = Vec::new();
-        if !table.headers.is_empty() {
-            rows.push(table.headers.clone());
-        }
-        rows.extend(table.rows.clone());
-
-        if rows.is_empty() {
-            return;
-        }
-
-        let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
-        if col_count == 0 {
-            return;
-        }
-
-        for row in &mut rows {
-            while row.len() < col_count {
-                row.push(String::new());
-            }
-        }
-
-        let mut widths = vec![3usize; col_count];
-        for row in &rows {
-            for (idx, cell) in row.iter().enumerate() {
-                widths[idx] = widths[idx].max(cell.chars().count());
-            }
-        }
-
-        if let Some(header) = rows.first() {
-            let line = Self::format_table_row(header, &widths);
-            self.push_text(&line, Style::default().fg(Color::Yellow));
-            self.flush_line(false);
-
-            let mut sep_cells = Vec::with_capacity(col_count);
-            for (idx, width) in widths.iter().enumerate() {
-                let align = table
-                    .alignments
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(Alignment::None);
-                let sep = match align {
-                    Alignment::Left => format!(":{}", "-".repeat(width.saturating_sub(1))),
-                    Alignment::Center => {
-                        if *width <= 1 {
-                            ":".to_string()
-                        } else {
-                            format!(":{}:", "-".repeat(width.saturating_sub(2)))
-                        }
-                    }
-                    Alignment::Right => format!("{}:", "-".repeat(width.saturating_sub(1))),
-                    Alignment::None => "-".repeat(*width),
-                };
-                sep_cells.push(sep);
-            }
-            let sep_line = Self::format_table_row(&sep_cells, &widths);
-            self.push_text(&sep_line, Style::default().fg(Color::DarkGray));
-            self.flush_line(false);
-
-            for row in rows.iter().skip(1) {
-                let row_line = Self::format_table_row(row, &widths);
-                self.push_text(&row_line, Style::default());
-                self.flush_line(false);
-            }
-        }
-    }
-
-    fn format_table_row(row: &[String], widths: &[usize]) -> String {
-        let mut output = String::from("| ");
-        for (idx, cell) in row.iter().enumerate() {
-            let width = widths[idx];
-            let padded = format!("{cell:<width$}");
-            output.push_str(&padded);
-            output.push_str(" | ");
-        }
-        output
-    }
-}
-
-fn render_markdown(source: &str, syntax_set: &SyntaxSet, theme: &Theme) -> RenderedDocument {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_SMART_PUNCTUATION);
-
-    let parser = MdParser::new_ext(source, options);
-    let mut renderer = Renderer::new(syntax_set, theme);
-
-    for event in parser {
-        match event {
-            MdEvent::Start(tag) => renderer.handle_start(tag),
-            MdEvent::End(tag) => renderer.handle_end(tag),
-            MdEvent::Text(text) => renderer.add_text(&text),
-            MdEvent::Code(code) => renderer.add_inline_code(&code),
-            MdEvent::Html(html) | MdEvent::InlineHtml(html) => renderer.add_text(&html),
-            MdEvent::FootnoteReference(name) => renderer.add_text(&format!("[^{name}]")),
-            MdEvent::SoftBreak => renderer.soft_break(),
-            MdEvent::HardBreak => renderer.hard_break(),
-            MdEvent::Rule => renderer.add_rule(),
-            MdEvent::TaskListMarker(done) => renderer.add_task_marker(done),
-            _ => {}
-        }
-    }
-
-    renderer.finish()
-}
-
-#[derive(Clone)]
-struct LoadResult {
-    path: Option<PathBuf>,
-    source: String,
-}
-
-enum InputSource {
-    File(PathBuf),
-    Stdin,
-}
-
-fn detect_input(cli: &Cli) -> Result<InputSource> {
-    match cli.input.as_deref() {
-        Some("-") => Ok(InputSource::Stdin),
-        Some(path) => Ok(InputSource::File(PathBuf::from(path))),
-        None => {
-            if io::stdin().is_terminal() {
-                Err(anyhow!(
-                    "No input provided. Pass a markdown file or pipe markdown into stdin."
-                ))
-            } else {
-                Ok(InputSource::Stdin)
-            }
-        }
-    }
-}
-
-fn read_input(source: &InputSource) -> Result<LoadResult> {
-    match source {
-        InputSource::File(path) => {
-            let source = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            Ok(LoadResult {
-                path: Some(path.clone()),
-                source,
-            })
-        }
-        InputSource::Stdin => {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .context("Failed to read markdown from stdin")?;
-            Ok(LoadResult {
-                path: None,
-                source: buf,
-            })
-        }
-    }
-}
-
-fn is_tty_stdout() -> bool {
-    io::stdout().is_terminal()
-}
-
-fn default_interactive(input: &InputSource) -> bool {
-    matches!(input, InputSource::File(_)) && is_tty_stdout()
-}
-
-fn resolve_theme(theme_set: &ThemeSet) -> Theme {
-    if let Some(theme) = theme_set.themes.get("base16-ocean.dark") {
-        return theme.clone();
-    }
-    theme_set
-        .themes
-        .values()
-        .next()
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn plain_render(doc: &RenderedDocument) -> String {
-    let mut out = String::new();
-    for (idx, line) in doc.lines.iter().enumerate() {
-        out.push_str(&line.plain);
-        if idx + 1 < doc.lines.len() {
-            out.push('\n');
-        }
-    }
-    out
-}
-
-#[derive(Clone)]
-enum LinkAction {
-    InternalMarkdown(PathBuf),
-    ExternalUrl(String),
-    ExternalPath(PathBuf),
-    Anchor(String),
-    Unknown(String),
-}
-
-fn classify_link(target: &str, current_doc: Option<&Path>) -> LinkAction {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return LinkAction::ExternalUrl(target.to_string());
-    }
-
-    if target.starts_with('#') {
-        return LinkAction::Anchor(target.to_string());
-    }
-
-    let (path_part, _fragment) = if let Some((path, frag)) = target.split_once('#') {
-        (path, Some(frag))
-    } else {
-        (target, None)
-    };
-
-    if path_part.is_empty() {
-        return LinkAction::Anchor(target.to_string());
-    }
-
-    let path = PathBuf::from(path_part);
-    let resolved = if path.is_absolute() {
-        path
-    } else if let Some(doc) = current_doc {
-        if let Some(parent) = doc.parent() {
-            parent.join(path)
-        } else {
-            path
-        }
-    } else {
-        PathBuf::from(path_part)
-    };
-
-    let ext = resolved
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase);
-
-    if matches!(ext.as_deref(), Some("md" | "markdown" | "mdx")) {
-        return LinkAction::InternalMarkdown(resolved);
-    }
-
-    if resolved.exists() {
-        return LinkAction::ExternalPath(resolved);
-    }
-
-    LinkAction::Unknown(target.to_string())
-}
-
-#[derive(Debug, Default)]
-struct LineDiffResult {
-    added: usize,
-    removed: usize,
-    hunks: Vec<DiffHunk>,
-    overflow: bool,
-}
-
-#[derive(Clone, Copy)]
-enum DiffOp {
-    Equal,
-    Add,
-    Remove,
-}
-
-#[derive(Clone, Copy)]
-enum ChangeFreshness {
-    Bright,
-    Dim,
-}
-
-fn change_freshness(created_instant: Instant) -> Option<ChangeFreshness> {
-    let age = created_instant.elapsed();
-    if age <= BRIGHT_CHANGE_WINDOW {
-        Some(ChangeFreshness::Bright)
-    } else if age <= DIM_CHANGE_WINDOW {
-        Some(ChangeFreshness::Dim)
-    } else {
-        None
-    }
-}
-
-fn format_clock_hms(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        % 86_400;
-    let hour = seconds / 3_600;
-    let minute = (seconds % 3_600) / 60;
-    let second = seconds % 60;
-    format!("{hour:02}:{minute:02}:{second:02}")
-}
-
-fn truncate_label(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    let mut out = String::new();
-    for ch in text.chars().take(max_chars.saturating_sub(1)) {
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
-fn heading_index_for_line(toc: &[TocEntry], line: usize) -> Option<usize> {
-    if toc.is_empty() {
-        return None;
-    }
-
-    toc.iter()
-        .enumerate()
-        .rfind(|(_, entry)| entry.line <= line)
-        .map(|(idx, _)| idx)
-        .or(Some(0))
-}
-
-fn hunk_anchor_line(hunk: &DiffHunk, total_lines: usize) -> usize {
-    if total_lines == 0 {
-        return 0;
-    }
-
-    if hunk.end_line > hunk.start_line {
-        hunk.start_line.min(total_lines.saturating_sub(1))
-    } else {
-        hunk.start_line
-            .saturating_sub(1)
-            .min(total_lines.saturating_sub(1))
-    }
-}
-
-fn touched_toc_indices_for_hunk(
-    hunk: &DiffHunk,
-    toc: &[TocEntry],
-    total_lines: usize,
-) -> Vec<usize> {
-    if toc.is_empty() {
-        return Vec::new();
-    }
-
-    let start_line = if total_lines == 0 {
-        0
-    } else {
-        hunk.start_line.min(total_lines.saturating_sub(1))
-    };
-    let end_line = if total_lines == 0 {
-        0
-    } else if hunk.end_line > hunk.start_line {
-        hunk.end_line
-            .saturating_sub(1)
-            .min(total_lines.saturating_sub(1))
-    } else {
-        hunk.start_line
-            .saturating_sub(1)
-            .min(total_lines.saturating_sub(1))
-    };
-
-    let from = start_line.min(end_line);
-    let to = start_line.max(end_line);
-    let Some(start_idx) = heading_index_for_line(toc, from) else {
-        return Vec::new();
-    };
-    let end_idx = heading_index_for_line(toc, to).unwrap_or(start_idx);
-    (start_idx..=end_idx).collect()
-}
-
-fn build_snapshot_diff(previous: &RenderedDocument, next: &RenderedDocument) -> SnapshotDiff {
-    let old_lines: Vec<&str> = previous
-        .lines
-        .iter()
-        .map(|line| line.plain.as_str())
-        .collect();
-    let new_lines: Vec<&str> = next.lines.iter().map(|line| line.plain.as_str()).collect();
-    let line_diff = compute_line_diff(&old_lines, &new_lines, DIFF_MAX_CELLS);
-
-    let mut section_deltas: BTreeMap<usize, SectionDelta> = BTreeMap::new();
-    for hunk in &line_diff.hunks {
-        let touched = touched_toc_indices_for_hunk(hunk, &next.toc, next.lines.len());
-        for idx in &touched {
-            section_deltas.entry(*idx).or_default();
-        }
-        if let Some(primary) = touched.first() {
-            let entry = section_deltas.entry(*primary).or_default();
-            entry.added = entry.added.saturating_add(hunk.added);
-            entry.removed = entry.removed.saturating_add(hunk.removed);
-        }
-    }
-
-    let top_section = section_deltas
-        .first_key_value()
-        .and_then(|(idx, _)| next.toc.get(*idx).map(|entry| entry.title.clone()));
-
-    SnapshotDiff {
-        added: line_diff.added,
-        removed: line_diff.removed,
-        hunks: line_diff.hunks,
-        section_deltas,
-        top_section,
-        overflow: line_diff.overflow,
-    }
-}
-
-fn compute_line_diff(old_lines: &[&str], new_lines: &[&str], max_cells: usize) -> LineDiffResult {
-    let mut prefix = 0usize;
-    while prefix < old_lines.len()
-        && prefix < new_lines.len()
-        && old_lines[prefix] == new_lines[prefix]
-    {
-        prefix += 1;
-    }
-
-    let mut old_end = old_lines.len();
-    let mut new_end = new_lines.len();
-    while old_end > prefix
-        && new_end > prefix
-        && old_lines[old_end.saturating_sub(1)] == new_lines[new_end.saturating_sub(1)]
-    {
-        old_end = old_end.saturating_sub(1);
-        new_end = new_end.saturating_sub(1);
-    }
-
-    let old_mid = &old_lines[prefix..old_end];
-    let new_mid = &new_lines[prefix..new_end];
-
-    if old_mid.is_empty() && new_mid.is_empty() {
-        return LineDiffResult::default();
-    }
-
-    if old_mid.is_empty() {
-        return LineDiffResult {
-            added: new_mid.len(),
-            removed: 0,
-            hunks: vec![DiffHunk {
-                start_line: prefix,
-                end_line: prefix.saturating_add(new_mid.len()),
-                added: new_mid.len(),
-                removed: 0,
-            }],
-            overflow: false,
-        };
-    }
-
-    if new_mid.is_empty() {
-        return LineDiffResult {
-            added: 0,
-            removed: old_mid.len(),
-            hunks: vec![DiffHunk {
-                start_line: prefix,
-                end_line: prefix,
-                added: 0,
-                removed: old_mid.len(),
-            }],
-            overflow: false,
-        };
-    }
-
-    let rows = old_mid.len().saturating_add(1);
-    let cols = new_mid.len().saturating_add(1);
-    if rows.saturating_mul(cols) > max_cells {
-        return LineDiffResult {
-            added: new_mid.len(),
-            removed: old_mid.len(),
-            hunks: vec![DiffHunk {
-                start_line: prefix,
-                end_line: prefix.saturating_add(new_mid.len()),
-                added: new_mid.len(),
-                removed: old_mid.len(),
-            }],
-            overflow: true,
-        };
-    }
-
-    let mut table = vec![0u32; rows.saturating_mul(cols)];
-    for i in 1..rows {
-        for j in 1..cols {
-            let idx = i.saturating_mul(cols).saturating_add(j);
-            table[idx] = if old_mid[i.saturating_sub(1)] == new_mid[j.saturating_sub(1)] {
-                table[(i.saturating_sub(1))
-                    .saturating_mul(cols)
-                    .saturating_add(j.saturating_sub(1))]
-                .saturating_add(1)
-            } else {
-                table[(i.saturating_sub(1)).saturating_mul(cols).saturating_add(j)]
-                    .max(table[i.saturating_mul(cols).saturating_add(j.saturating_sub(1))])
-            };
-        }
-    }
-
-    let mut ops_reversed = Vec::with_capacity(old_mid.len().saturating_add(new_mid.len()));
-    let mut i = old_mid.len();
-    let mut j = new_mid.len();
-
-    while i > 0 && j > 0 {
-        if old_mid[i.saturating_sub(1)] == new_mid[j.saturating_sub(1)] {
-            ops_reversed.push(DiffOp::Equal);
-            i = i.saturating_sub(1);
-            j = j.saturating_sub(1);
-            continue;
-        }
-
-        let up = table[(i.saturating_sub(1)).saturating_mul(cols).saturating_add(j)];
-        let left = table[i.saturating_mul(cols).saturating_add(j.saturating_sub(1))];
-        if up >= left {
-            ops_reversed.push(DiffOp::Remove);
-            i = i.saturating_sub(1);
-        } else {
-            ops_reversed.push(DiffOp::Add);
-            j = j.saturating_sub(1);
-        }
-    }
-
-    while i > 0 {
-        ops_reversed.push(DiffOp::Remove);
-        i = i.saturating_sub(1);
-    }
-    while j > 0 {
-        ops_reversed.push(DiffOp::Add);
-        j = j.saturating_sub(1);
-    }
-
-    ops_reversed.reverse();
-
-    let mut hunks = Vec::new();
-    let mut current: Option<DiffHunk> = None;
-    let mut new_index = prefix;
-    let mut added = 0usize;
-    let mut removed = 0usize;
-
-    for op in ops_reversed {
-        match op {
-            DiffOp::Equal => {
-                new_index = new_index.saturating_add(1);
-                if let Some(hunk) = current.take() {
-                    hunks.push(hunk);
-                }
-            }
-            DiffOp::Add => {
-                added = added.saturating_add(1);
-                let hunk = current.get_or_insert(DiffHunk {
-                    start_line: new_index,
-                    end_line: new_index,
-                    added: 0,
-                    removed: 0,
-                });
-                hunk.added = hunk.added.saturating_add(1);
-                new_index = new_index.saturating_add(1);
-                hunk.end_line = new_index;
-            }
-            DiffOp::Remove => {
-                removed = removed.saturating_add(1);
-                let hunk = current.get_or_insert(DiffHunk {
-                    start_line: new_index,
-                    end_line: new_index,
-                    added: 0,
-                    removed: 0,
-                });
-                hunk.removed = hunk.removed.saturating_add(1);
-            }
-        }
-    }
-
-    if let Some(hunk) = current.take() {
-        hunks.push(hunk);
-    }
-
-    LineDiffResult {
-        added,
-        removed,
-        hunks,
-        overflow: false,
-    }
 }
 
 struct App {
@@ -1369,6 +126,27 @@ struct App {
 }
 
 impl App {
+    fn first_link_selection(rendered: &RenderedDocument) -> Option<usize> {
+        if rendered.links.is_empty() {
+            None
+        } else {
+            Some(0)
+        }
+    }
+
+    fn reset_selected_link(&mut self) {
+        self.selected_link = Self::first_link_selection(&self.doc.rendered);
+    }
+
+    fn require_watch_mode(&mut self, status: &str) -> bool {
+        if self.cli.watch {
+            true
+        } else {
+            self.status = status.to_string();
+            false
+        }
+    }
+
     fn new(
         cli: Cli,
         load: LoadResult,
@@ -1376,11 +154,7 @@ impl App {
         syntax_set: SyntaxSet,
         theme: Theme,
     ) -> Self {
-        let selected_link = if rendered.links.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        let selected_link = Self::first_link_selection(&rendered);
         let mut snapshots = VecDeque::new();
         snapshots.push_back(WatchSnapshot {
             revision: 1,
@@ -1454,11 +228,7 @@ impl App {
         };
 
         self.doc.rendered = snapshot.rendered;
-        self.selected_link = if self.doc.rendered.links.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        self.reset_selected_link();
 
         self.update_search_matches();
         if self.search_query.is_empty() || self.search_matches.is_empty() {
@@ -1524,16 +294,14 @@ impl App {
     }
 
     fn toggle_timeline(&mut self) {
-        if !self.cli.watch {
-            self.status = "Timeline is available only in --watch mode".to_string();
+        if !self.require_watch_mode("Timeline is available only in --watch mode") {
             return;
         }
         self.timeline_open = !self.timeline_open;
     }
 
     fn move_revision_relative(&mut self, older: bool) {
-        if !self.cli.watch {
-            self.status = "Revision navigation is available only in --watch mode".to_string();
+        if !self.require_watch_mode("Revision navigation is available only in --watch mode") {
             return;
         }
         if self.snapshots.len() <= 1 {
@@ -1575,8 +343,7 @@ impl App {
     }
 
     fn jump_to_live_revision(&mut self) {
-        if !self.cli.watch {
-            self.status = "Jump-to-live is available only in --watch mode".to_string();
+        if !self.require_watch_mode("Jump-to-live is available only in --watch mode") {
             return;
         }
         if self.snapshots.is_empty() {
@@ -1812,11 +579,7 @@ impl App {
             rendered,
         };
 
-        self.selected_link = if self.doc.rendered.links.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        self.reset_selected_link();
 
         if preserve_scroll {
             self.scroll = old_scroll;
@@ -2368,11 +1131,7 @@ impl App {
         if !self.status.is_empty() {
             parts.push(self.status.clone());
         }
-        let status_text = if parts.is_empty() {
-            String::new()
-        } else {
-            parts.join(" | ")
-        };
+        let status_text = parts.join(" | ");
 
         frame.render_widget(
             Paragraph::new(format!(" {status_text}")).style(Style::default().fg(Color::Gray)),
@@ -2571,12 +1330,10 @@ fn main() -> Result<()> {
         return Err(anyhow!("--watch requires file input"));
     }
 
-    let interactive = if cli.interactive {
-        true
-    } else if cli.plain {
-        false
-    } else {
-        default_interactive(&input)
+    let interactive = match (cli.interactive, cli.plain) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => default_interactive(&input),
     };
 
     let load = read_input(&input)?;
