@@ -18,17 +18,12 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
 - LLM orchestration/execution inside `catmd` in V1.
 - Replacing external coding-agent tools or chat UX.
 
-## 5. Success Metrics (optional)
-- 80%+ of agent notes in pilot docs use the supported marker format after 2 weeks.
-- Median time to navigate to next unresolved agent task is under 1 second.
-- 50% reduction in "forgotten cleanup note" incidents in user-reported sessions.
-
-## 6. Users / Personas
+## 5. Users / Personas
 - Primary: developers using a coding agent with `catmd` open in a side pane.
 - Secondary: technical writers or PMs collaborating with agents on long Markdown docs.
 
-## 7. UX Requirements
-### 7.1 Primary Workflows
+## 6. UX Requirements
+### 6.1 Primary Workflows
 - Workflow 1: Leave an agent task in the markdown file
   - User writes an agent-addressable task in Markdown using the supported syntax.
   - `catmd` highlights it as an unresolved collaboration item.
@@ -39,7 +34,7 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
   - After the agent updates the file, tasks marked complete are shown as resolved.
   - Inbox count drops and status bar reflects remaining unresolved items.
 
-### 7.2 Screens / States / Routes
+### 6.2 Screens / States / Routes
 - Main content view:
   - Collaboration items are visually distinct from regular task lists.
   - Each item shows status badge (`OPEN`, `DONE`) and optional metadata (owner/tag).
@@ -52,16 +47,16 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
   - `No agent tasks found` when no markers exist.
   - `All agent tasks complete` when zero unresolved tasks remain.
 
-### 7.3 Accessibility / Platform
+### 6.3 Accessibility / Platform
 - Terminal-first and keyboard-only.
 - All collaboration actions reachable without mouse input.
 - Maintain parity with existing vim-style navigation conventions.
 
-### 7.4 Performance (optional)
+### 6.4 Performance (optional)
 - Agent task extraction should add negligible overhead to watch reloads for typical files (<5,000 lines).
 - Opening or navigating the inbox should feel instant (<50ms local state switch target).
 
-## 8. Functional Requirements
+## 7. Functional Requirements
 - FR-1 (Must): The system shall recognize agent-task markers in Markdown using a documented V1 syntax.
   - Acceptance criteria: V1 supports checklist syntax `- [ ] @agent ...` (open) and `- [x] @agent ...` (done).
   - Acceptance criteria: parser ignores case for `@agent` tag matching.
@@ -95,7 +90,12 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
 - FR-9 (Won't, V1): The system shall not directly trigger coding-agent actions from inside `catmd`.
   - Acceptance criteria: no built-in "run agent" or LLM API action in V1.
 
-## 9. Non-functional Requirements (optional)
+- FR-10 (Should): The system shall support lightweight task capture from inside `catmd`.
+  - Acceptance criteria: pressing `A` or `Ctrl-a` opens a text capture prompt.
+  - Acceptance criteria: pressing `Enter` appends `- [ ] @agent ...` to the current file.
+  - Acceptance criteria: feature is disabled for stdin sessions.
+
+## 8. Non-functional Requirements (optional)
 - NFR-1 (Must): Existing keybindings and watch timeline behavior shall remain intact.
   - Acceptance criteria: regression tests/manual checks confirm current navigation still works.
 
@@ -105,7 +105,7 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
 - NFR-3 (Should): Collaboration markers shall remain readable in low-color terminals.
   - Acceptance criteria: symbol/text fallbacks exist when color contrast is limited.
 
-## 10. Versions and Scope
+## 9. Versions and Scope
 ### V1 (2026-02-19)
 - Decisions made:
   - Start with explicit checklist-tag syntax (`- [ ] @agent ...`).
@@ -116,8 +116,11 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
   - Inline visual treatment for `open` vs `done`.
   - Agent Inbox panel + next/previous unresolved navigation.
   - Status bar summary (`open/total`).
+  - Quick task capture (`A` / `Ctrl-a`) to append new unresolved `@agent` tasks.
 - Notes:
   - Designed to ship quickly and validate behavior with existing split-view workflows.
+  - Implemented: FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-10, NFR-1, NFR-2.
+  - Remaining for post-V1: FR-7, FR-8.
 
 ### V2 (2026-03-xx)
 - Decisions made:
@@ -139,12 +142,12 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
 - Notes:
   - Still no required cloud service in base offering.
 
-## 11. Post-V3 / Future Ideas
+## 10. Post-V3 / Future Ideas
 - Per-task timestamps (`created`, `resolved`) inferred from timeline revisions.
 - "Needs human review" reciprocal tag (`@human`) for agent-to-user handoff loops.
 - Export unresolved tasks as markdown checklist summary.
 
-## 12. Dependencies (optional)
+## 11. Dependencies (optional)
 - Internal:
   - Existing markdown parsing and rendered line model.
   - Existing watch reload pipeline and status bar.
@@ -152,7 +155,7 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
 - External:
   - None required for V1 beyond current crate set.
 
-## 13. Risks and Mitigations
+## 12. Risks and Mitigations
 - Risk: Marker syntax feels too rigid and users keep writing free-form comments.
   - Mitigation: start with one obvious format and add aliases in V2.
 
@@ -162,16 +165,16 @@ In agent-assisted workflows, the Markdown file is often the working surface for 
 - Risk: Keybinding collisions with current navigation.
   - Mitigation: reserve minimal new keys and document in status/help text.
 
-## 14. Open Questions
-- Which keybindings should control:
-  - Agent Inbox toggle
-  - Next/previous unresolved task
-  - Jump from inbox item to content (reuse `Enter`?)
-- Should agent tasks be restricted to checklist items only in V1, or include headings/paragraph annotations?
+## 13. Open Questions
+- Should quick task capture support inserting at cursor location instead of appending to end of file?
+- Should V2 support toggling task done/open directly from Agent Inbox?
 - Should status bar counts include only visible file scope or all loaded snapshots in history mode?
-- Should `@agent` matching be exact tag token or substring match?
 
-## 15. Decision Log
+## 14. Decision Log
 - 2026-02-19: Prioritize lightweight shared-canvas semantics over deep automation.
 - 2026-02-19: V1 collaboration primitive is `@agent` checklist items with open/done state.
 - 2026-02-19: Inbox + keyboard navigation are required in V1 to reduce missed cleanup tasks.
+- 2026-02-19: Keybindings chosen for V1 are `a` (inbox), `{`/`}` (task nav), and `Enter` (jump in panel).
+- 2026-02-19: `@agent` matching in V1 uses case-insensitive token-boundary matching.
+- 2026-02-19: Removed Success Metrics section from this PRD and deferred metrics until post-V1 pilot.
+- 2026-02-19: Removed placeholder checklist task entries accidentally appended during interactive testing.

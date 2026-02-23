@@ -74,14 +74,20 @@ catmd notes.md --watch --history 200
 - `g` / `G`: top/bottom
 - `/`: search (incremental as you type)
 - `n` / `N`: next/previous search match
+- `?`: toggle keyboard shortcuts help
+- `A` or `Ctrl-a`: quick-add a new `@agent` task (appends to current file)
 - `t`: toggle TOC sidebar
+- `a`: toggle Agent Inbox sidebar
 - `[` / `]`: jump to previous/next heading
 - `j` / `k` (when TOC is open): move TOC selection
+- `j` / `k` (when Agent Inbox is open): move task selection
 - `Enter` (when TOC is open): jump to selected TOC heading
+- `Enter` (when Agent Inbox is open): jump to selected unresolved agent task
 - `Tab` / `Shift-Tab`: next/previous link
 - `Enter`: open selected link (when TOC is closed)
 - `o`: open selected link externally (browser/system opener)
 - `Backspace`: go back in local markdown backstack
+- `{` / `}`: previous/next unresolved `@agent` task
 - `v`: toggle timeline dock (watch mode)
 - `h` / `l` or `Left` / `Right`: older/newer revision (watch mode)
 - `L`: jump back to live/latest revision (watch mode)
@@ -112,6 +118,21 @@ Images render as placeholders with alt text and path:
 - in-memory revision history is kept with `--history <N>` (default `50`)
 - timeline dock shows revision id, timestamp, `+/-` summary, touched section count, and top changed section
 - status bar shows `LIVE` vs `HISTORY` mode
+
+## Agent Collaboration
+
+Agent tasks are recognized from checklist lines tagged with `@agent`:
+
+```md
+- [ ] @agent clean up this section
+- [x] @agent done
+```
+
+- unresolved tasks are highlighted inline
+- completed tasks are shown in a subdued style
+- Agent Inbox shows unresolved items and jumps to them by line
+- status bar shows `agent: open/total` counts when tasks exist
+- quick capture: press `A` (or `Ctrl-a`), type task text, press `Enter` to append `- [ ] @agent ...`
 
 ## Roadmap
 

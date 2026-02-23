@@ -18,16 +18,18 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::prelude::{Color, Modifier, Rect, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::block::Padding;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Terminal;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+mod agent;
 mod diff;
 mod input;
 mod links;
 mod markdown;
 
+use agent::{extract_agent_tasks, AgentTask, AgentTaskState};
 use diff::{
     build_snapshot_diff, change_freshness, format_clock_hms, hunk_anchor_line, truncate_label,
     ChangeFreshness, SnapshotDiff, WatchSnapshot,
@@ -44,6 +46,8 @@ use markdown::{RenderedLine, TocEntry};
 const NO_TOC_HEADINGS_STATUS: &str = "No headings in TOC";
 const TIMELINE_DEFAULT_HEIGHT: u16 = 6;
 const TIMELINE_MIN_HEIGHT: u16 = 3;
+const NO_AGENT_TASKS_STATUS: &str = "No agent tasks found";
+const NO_OPEN_AGENT_TASKS_STATUS: &str = "All agent tasks complete";
 
 fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
     let x = area.x.saturating_add(horizontal);
@@ -56,6 +60,21 @@ fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
         width,
         height,
     }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::vertical([
+        Constraint::Percentage((100_u16.saturating_sub(percent_y)) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100_u16.saturating_sub(percent_y)) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100_u16.saturating_sub(percent_x)) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100_u16.saturating_sub(percent_x)) / 2),
+    ])
+    .split(vertical[1])[1]
 }
 
 fn usize_to_u16_saturating(value: usize) -> u16 {
@@ -108,6 +127,9 @@ struct App {
     viewport_height: u16,
     toc_open: bool,
     toc_selected: usize,
+    agent_inbox_open: bool,
+    agent_selected: usize,
+    help_open: bool,
     timeline_open: bool,
     timeline_height: u16,
 
@@ -118,6 +140,11 @@ struct App {
     search_query: String,
     search_matches: Vec<usize>,
     current_match: usize,
+    quick_task_mode: bool,
+    quick_task_input: String,
+
+    agent_tasks: Vec<AgentTask>,
+    open_agent_tasks: Vec<usize>,
 
     status: String,
 
@@ -155,6 +182,12 @@ impl App {
         theme: Theme,
     ) -> Self {
         let selected_link = Self::first_link_selection(&rendered);
+        let agent_tasks = extract_agent_tasks(&rendered);
+        let open_agent_tasks = agent_tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, task)| task.is_open().then_some(idx))
+            .collect();
         let mut snapshots = VecDeque::new();
         snapshots.push_back(WatchSnapshot {
             revision: 1,
@@ -182,6 +215,9 @@ impl App {
             viewport_height: 1,
             toc_open: false,
             toc_selected: 0,
+            agent_inbox_open: false,
+            agent_selected: 0,
+            help_open: false,
             timeline_open: false,
             timeline_height: TIMELINE_DEFAULT_HEIGHT,
             selected_link,
@@ -190,9 +226,246 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             current_match: 0,
+            quick_task_mode: false,
+            quick_task_input: String::new(),
+            agent_tasks,
+            open_agent_tasks,
             status: String::new(),
             watcher: None,
             watch_requested: false,
+        }
+    }
+
+    fn refresh_agent_tasks(&mut self) {
+        let selected_line = self
+            .open_agent_tasks
+            .get(self.agent_selected)
+            .and_then(|idx| self.agent_tasks.get(*idx))
+            .map(|task| task.line);
+
+        self.agent_tasks = extract_agent_tasks(&self.doc.rendered);
+        self.open_agent_tasks = self
+            .agent_tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, task)| task.is_open().then_some(idx))
+            .collect();
+
+        if self.open_agent_tasks.is_empty() {
+            self.agent_selected = 0;
+            return;
+        }
+
+        if let Some(line) = selected_line {
+            if let Some(position) = self
+                .open_agent_tasks
+                .iter()
+                .position(|idx| self.agent_tasks[*idx].line == line)
+            {
+                self.agent_selected = position;
+                return;
+            }
+        }
+
+        self.agent_selected = self
+            .agent_selected
+            .min(self.open_agent_tasks.len().saturating_sub(1));
+    }
+
+    fn selected_open_agent_task(&self) -> Option<&AgentTask> {
+        self.open_agent_tasks
+            .get(self.agent_selected)
+            .and_then(|idx| self.agent_tasks.get(*idx))
+    }
+
+    fn selected_open_agent_line(&self) -> Option<usize> {
+        self.selected_open_agent_task().map(|task| task.line)
+    }
+
+    fn status_for_empty_open_tasks(&mut self) {
+        self.status = if self.agent_tasks.is_empty() {
+            NO_AGENT_TASKS_STATUS.to_string()
+        } else {
+            NO_OPEN_AGENT_TASKS_STATUS.to_string()
+        };
+    }
+
+    fn sync_agent_selected_with_scroll(&mut self) {
+        if self.open_agent_tasks.is_empty() {
+            self.agent_selected = 0;
+            return;
+        }
+
+        let line = usize::from(self.scroll);
+        self.agent_selected = self
+            .open_agent_tasks
+            .iter()
+            .enumerate()
+            .rfind(|(_, idx)| self.agent_tasks[**idx].line <= line)
+            .map_or(0, |(position, _)| position);
+    }
+
+    fn toggle_toc(&mut self) {
+        self.toc_open = !self.toc_open;
+        if self.toc_open {
+            self.agent_inbox_open = false;
+            self.sync_toc_selected_with_scroll();
+        }
+    }
+
+    fn toggle_agent_inbox(&mut self) {
+        self.agent_inbox_open = !self.agent_inbox_open;
+        if self.agent_inbox_open {
+            self.toc_open = false;
+            self.sync_agent_selected_with_scroll();
+        }
+    }
+
+    fn move_agent_selection(&mut self, reverse: bool) {
+        let len = self.open_agent_tasks.len();
+        if len == 0 {
+            self.status_for_empty_open_tasks();
+            return;
+        }
+
+        if reverse {
+            self.agent_selected = self.agent_selected.saturating_sub(1);
+        } else {
+            self.agent_selected = (self.agent_selected + 1).min(len.saturating_sub(1));
+        }
+    }
+
+    fn jump_to_open_agent_index(&mut self, index: usize) {
+        let len = self.open_agent_tasks.len();
+        if len == 0 {
+            self.status_for_empty_open_tasks();
+            return;
+        }
+
+        self.agent_selected = index.min(len.saturating_sub(1));
+        let Some(task) = self.selected_open_agent_task().cloned() else {
+            self.status_for_empty_open_tasks();
+            return;
+        };
+
+        self.set_scroll_to_line(task.line);
+        self.status = format!(
+            "Agent task {}/{}: {}",
+            self.agent_selected + 1,
+            len,
+            truncate_label(&task.text, 48)
+        );
+    }
+
+    fn jump_to_selected_agent_task(&mut self) {
+        self.jump_to_open_agent_index(self.agent_selected);
+    }
+
+    fn jump_agent_task_relative(&mut self, reverse: bool) {
+        let len = self.open_agent_tasks.len();
+        if len == 0 {
+            self.status_for_empty_open_tasks();
+            return;
+        }
+
+        let line = usize::from(self.scroll);
+        let target = if reverse {
+            self.open_agent_tasks
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, idx)| self.agent_tasks[**idx].line < line)
+                .map_or(len.saturating_sub(1), |(position, _)| position)
+        } else {
+            self.open_agent_tasks
+                .iter()
+                .enumerate()
+                .find(|(_, idx)| self.agent_tasks[**idx].line > line)
+                .map_or(0, |(position, _)| position)
+        };
+
+        self.jump_to_open_agent_index(target);
+    }
+
+    fn begin_quick_task_capture(&mut self) {
+        if self.doc.path.is_none() {
+            self.status = "Quick task capture requires file input".to_string();
+            return;
+        }
+        self.quick_task_mode = true;
+        self.quick_task_input.clear();
+        self.status = "New @agent task: type text, Enter to save, Esc to cancel".to_string();
+    }
+
+    fn submit_quick_task_capture(&mut self) {
+        let task_text = self.quick_task_input.trim().to_string();
+        if task_text.is_empty() {
+            self.status = "Agent task cannot be empty".to_string();
+            return;
+        }
+
+        let Some(path) = self.doc.path.clone() else {
+            self.quick_task_mode = false;
+            self.quick_task_input.clear();
+            self.status = "Quick task capture requires file input".to_string();
+            return;
+        };
+
+        let result: Result<()> = (|| {
+            let mut source = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let task_line = format!("- [ ] @agent {task_text}");
+            if source.is_empty() {
+                source.push_str(&task_line);
+                source.push('\n');
+            } else {
+                if !source.ends_with('\n') {
+                    source.push('\n');
+                }
+                source.push_str(&task_line);
+                source.push('\n');
+            }
+
+            fs::write(&path, source).with_context(|| format!("Failed to write {}", path.display()))
+        })();
+
+        self.quick_task_mode = false;
+        self.quick_task_input.clear();
+
+        if let Err(err) = result {
+            self.status = format!("Failed to add agent task: {err:#}");
+            return;
+        }
+
+        if let Err(err) = self.reload_current() {
+            self.status = format!("Reload failed after adding task: {err:#}");
+            return;
+        }
+        self.watch_requested = false;
+        self.status = format!("Added agent task: {}", truncate_label(&task_text, 48));
+    }
+
+    fn handle_quick_task_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.quick_task_mode = false;
+                self.quick_task_input.clear();
+                self.status = "Canceled new @agent task".to_string();
+            }
+            KeyCode::Enter => {
+                self.submit_quick_task_capture();
+            }
+            KeyCode::Backspace => {
+                self.quick_task_input.pop();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.quick_task_input.push(c);
+            }
+            _ => {}
         }
     }
 
@@ -229,6 +502,7 @@ impl App {
 
         self.doc.rendered = snapshot.rendered;
         self.reset_selected_link();
+        self.refresh_agent_tasks();
 
         self.update_search_matches();
         if self.search_query.is_empty() || self.search_matches.is_empty() {
@@ -247,6 +521,7 @@ impl App {
 
         self.clamp_scroll();
         self.sync_toc_selected_with_scroll();
+        self.sync_agent_selected_with_scroll();
     }
 
     fn push_watch_snapshot(&mut self, rendered: RenderedDocument) -> bool {
@@ -413,6 +688,7 @@ impl App {
     fn set_scroll_and_sync(&mut self, scroll: u16) {
         self.scroll = scroll.min(self.max_scroll());
         self.sync_toc_selected_with_scroll();
+        self.sync_agent_selected_with_scroll();
     }
 
     fn set_scroll_to_line(&mut self, line: usize) {
@@ -588,9 +864,11 @@ impl App {
         }
 
         self.reset_snapshots_from_current_doc();
+        self.refresh_agent_tasks();
         self.update_search_matches();
         self.clamp_scroll();
         self.sync_toc_selected_with_scroll();
+        self.sync_agent_selected_with_scroll();
     }
 
     fn reload_current(&mut self) -> Result<()> {
@@ -796,14 +1074,18 @@ impl App {
             (chunks[0], None, inset_rect(chunks[1], 1, 0))
         };
 
-        let content_area = if self.toc_open {
+        let content_area = if self.toc_open || self.agent_inbox_open {
             let widths = [
                 Constraint::Length(body.width.saturating_div(3).max(24)),
                 Constraint::Length(1),
                 Constraint::Min(1),
             ];
             let cols = Layout::horizontal(widths).split(body);
-            self.draw_toc(frame, cols[0]);
+            if self.agent_inbox_open {
+                self.draw_agent_inbox(frame, cols[0]);
+            } else {
+                self.draw_toc(frame, cols[0]);
+            }
             cols[2]
         } else {
             body
@@ -816,6 +1098,12 @@ impl App {
             self.draw_timeline(frame, area);
         }
         self.draw_status(frame, status);
+        if self.help_open {
+            self.draw_shortcuts_help(frame);
+        }
+        if self.quick_task_mode {
+            self.draw_quick_task_capture(frame);
+        }
     }
 
     fn draw_toc(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -891,6 +1179,61 @@ impl App {
         frame.render_widget(toc, area);
     }
 
+    fn draw_agent_inbox(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let block = Block::default()
+            .title(" Agent Inbox ")
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .padding(Padding::new(1, 1, 0, 0));
+
+        if self.agent_tasks.is_empty() {
+            frame.render_widget(
+                Paragraph::new(format!(" {NO_AGENT_TASKS_STATUS}"))
+                    .style(Style::default().fg(Color::Gray))
+                    .block(block),
+                area,
+            );
+            return;
+        }
+
+        if self.open_agent_tasks.is_empty() {
+            frame.render_widget(
+                Paragraph::new(format!(" {NO_OPEN_AGENT_TASKS_STATUS}"))
+                    .style(Style::default().fg(Color::Gray))
+                    .block(block),
+                area,
+            );
+            return;
+        }
+
+        let selected = self
+            .agent_selected
+            .min(self.open_agent_tasks.len().saturating_sub(1));
+        let items: Vec<ListItem> = self
+            .open_agent_tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(position, task_index)| {
+                let task = self.agent_tasks.get(*task_index)?;
+                let row = format!("{:>4}  {}", task.line + 1, truncate_label(&task.text, 44));
+                let line = if position == selected {
+                    Line::styled(
+                        row,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Line::raw(row)
+                };
+                Some(ListItem::new(line))
+            })
+            .collect();
+
+        let list = List::new(items).block(block);
+        frame.render_widget(list, area);
+    }
+
     fn draw_timeline(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         if self.snapshots.len() <= 1 {
             let empty = Paragraph::new(" No prior revisions yet")
@@ -960,12 +1303,20 @@ impl App {
 
     fn draw_content(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let selected_link_line = self.selected_link_line();
+        let selected_open_agent_line = self.selected_open_agent_line();
         let total_lines = self.doc.rendered.lines.len();
         let mut changed_lines = vec![false; total_lines];
         let mut hunk_anchors = vec![false; total_lines];
+        let mut agent_states = vec![None; total_lines];
         let freshness = self
             .current_snapshot()
             .and_then(|snapshot| change_freshness(snapshot.created_instant));
+
+        for task in &self.agent_tasks {
+            if task.line < total_lines {
+                agent_states[task.line] = Some(task.state);
+            }
+        }
 
         if let Some(snapshot) = self.current_snapshot() {
             for hunk in &snapshot.diff.hunks {
@@ -997,8 +1348,10 @@ impl App {
             .map(|(idx, line)| {
                 let is_match = self.search_matches.binary_search(&idx).is_ok();
                 let is_selected_link_line = selected_link_line == Some(idx);
+                let is_selected_agent_line = selected_open_agent_line == Some(idx);
                 let is_changed = changed_lines.get(idx).copied().unwrap_or(false);
                 let is_hunk_anchor = hunk_anchors.get(idx).copied().unwrap_or(false);
+                let agent_state = agent_states.get(idx).copied().flatten();
 
                 let base_marker_style = match freshness {
                     Some(ChangeFreshness::Bright) => Style::default()
@@ -1009,6 +1362,18 @@ impl App {
                 };
                 let marker_span = if is_hunk_anchor {
                     Span::styled("▌ ", base_marker_style)
+                } else if let Some(state) = agent_state {
+                    match state {
+                        AgentTaskState::Open => Span::styled(
+                            "@ ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        AgentTaskState::Done => {
+                            Span::styled("@ ", Style::default().fg(Color::DarkGray))
+                        }
+                    }
                 } else {
                     Span::styled("  ", Style::default())
                 };
@@ -1019,6 +1384,12 @@ impl App {
                 } else {
                     spans.extend(line.segments.iter().map(|segment| {
                         let mut style = segment.style;
+                        if let Some(state) = agent_state {
+                            style = match state {
+                                AgentTaskState::Open => style.bg(Color::Rgb(16, 52, 44)),
+                                AgentTaskState::Done => style.fg(Color::DarkGray),
+                            };
+                        }
                         if is_changed {
                             style = match freshness {
                                 Some(ChangeFreshness::Bright) => style.bg(Color::Rgb(70, 35, 0)),
@@ -1031,6 +1402,9 @@ impl App {
                         }
                         if is_selected_link_line {
                             style = style.bg(Color::Blue).fg(Color::White);
+                        }
+                        if is_selected_agent_line && !is_selected_link_line {
+                            style = style.add_modifier(Modifier::BOLD);
                         }
                         Span::styled(segment.text.clone(), style)
                     }));
@@ -1092,6 +1466,15 @@ impl App {
                 self.search_matches.len()
             )
         };
+        let quick_task_hint = if self.quick_task_mode {
+            if self.quick_task_input.is_empty() {
+                " new_task='…'".to_string()
+            } else {
+                format!(" new_task='{}'", truncate_label(&self.quick_task_input, 48))
+            }
+        } else {
+            String::new()
+        };
 
         let mode_hint = if self.cli.watch {
             if let Some(snapshot) = self.current_snapshot() {
@@ -1121,22 +1504,149 @@ impl App {
         } else {
             String::new()
         };
+        let agent_hint = if self.agent_tasks.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "agent: {}/{} open",
+                self.open_agent_tasks.len(),
+                self.agent_tasks.len()
+            )
+        };
 
         let mut parts = Vec::new();
-        if !mode_hint.is_empty() {
-            parts.push(mode_hint);
-        }
-        parts.push(path);
-        parts.push(format!("{link_hint}{search_hint}"));
         if !self.status.is_empty() {
             parts.push(self.status.clone());
         }
+        if !mode_hint.is_empty() {
+            parts.push(mode_hint);
+        }
+        if !agent_hint.is_empty() {
+            parts.push(agent_hint);
+        }
+        parts.push(path);
+        parts.push(format!("{link_hint}{search_hint}{quick_task_hint}"));
         let status_text = parts.join(" | ");
 
         frame.render_widget(
             Paragraph::new(format!(" {status_text}")).style(Style::default().fg(Color::Gray)),
             area,
         );
+    }
+
+    fn draw_shortcuts_help(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(78, 88, frame.size());
+        let lines = vec![
+            Line::styled(
+                "General",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw("  q                Quit"),
+            Line::raw("  ?                Toggle this shortcuts view"),
+            Line::raw("  A or Ctrl-a      Add new @agent task (append to file)"),
+            Line::raw("  j / k            Scroll down / up"),
+            Line::raw("  Ctrl-d / Ctrl-u  Half-page down / up"),
+            Line::raw("  g / G            Top / bottom"),
+            Line::raw("  /                Search"),
+            Line::raw("  n / N            Next / previous match"),
+            Line::raw(""),
+            Line::styled(
+                "Navigation",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw("  t                Toggle TOC"),
+            Line::raw("  a                Toggle Agent Inbox"),
+            Line::raw("  [ / ]            Previous / next heading"),
+            Line::raw("  { / }            Previous / next unresolved @agent task"),
+            Line::raw("  Enter            Follow selected item/link"),
+            Line::raw("  Tab / Shift-Tab  Next / previous link"),
+            Line::raw("  o                Open selected link externally"),
+            Line::raw("  Backspace        Go back in local markdown history"),
+            Line::raw(""),
+            Line::styled(
+                "Watch Mode",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw("  v                Toggle timeline"),
+            Line::raw("  h / l            Older / newer revision"),
+            Line::raw("  L                Jump to live revision"),
+            Line::raw("  ( / )            Previous / next changed hunk"),
+            Line::raw(""),
+            Line::styled(
+                "Panels",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw("  j / k            Move selection in TOC or Agent Inbox"),
+            Line::raw("  Enter            Jump to selected TOC heading or agent task"),
+            Line::raw(""),
+            Line::styled(
+                "Press '?' (or Esc / q) to close",
+                Style::default().fg(Color::Gray),
+            ),
+        ];
+
+        let panel = Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(" Keyboard Shortcuts ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(Padding::new(1, 1, 0, 0)),
+            )
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(panel, area);
+    }
+
+    fn draw_quick_task_capture(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = centered_rect(74, 26, frame.size());
+        let entry = if self.quick_task_input.is_empty() {
+            "(type task text)".to_string()
+        } else {
+            self.quick_task_input.clone()
+        };
+        let lines = vec![
+            Line::styled(
+                "Append unresolved @agent task",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                format!("> {}", truncate_label(&entry, 120)),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "Enter saves to file, Esc cancels",
+                Style::default().fg(Color::Gray),
+            ),
+        ];
+
+        let panel = Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .title(" New Agent Task ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(Padding::new(1, 1, 0, 0)),
+            )
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(panel, area);
     }
 
     fn handle_search_input(&mut self, key: KeyEvent) {
@@ -1168,16 +1678,52 @@ impl App {
             return Ok(false);
         }
 
+        if self.quick_task_mode {
+            self.handle_quick_task_input(key);
+            return Ok(false);
+        }
+
+        if self.help_open {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.help_open = false;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('?') => {
+                self.help_open = true;
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.begin_quick_task_capture();
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.begin_quick_task_capture();
+            }
+            KeyCode::Char('A') => {
+                self.begin_quick_task_capture();
+            }
             KeyCode::Char('v') => {
                 self.toggle_timeline();
+            }
+            KeyCode::Char('a') => {
+                self.toggle_agent_inbox();
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 self.move_revision_relative(true);
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.move_revision_relative(false);
+            }
+            KeyCode::Char('{') => {
+                self.jump_agent_task_relative(true);
+            }
+            KeyCode::Char('}') => {
+                self.jump_agent_task_relative(false);
             }
             KeyCode::Char('L') => {
                 self.jump_to_live_revision();
@@ -1189,14 +1735,18 @@ impl App {
                 self.jump_hunk_relative(false);
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.toc_open {
+                if self.agent_inbox_open {
+                    self.move_agent_selection(false);
+                } else if self.toc_open {
                     self.move_toc_selection(false);
                 } else {
                     self.set_scroll_and_sync(self.scroll.saturating_add(1));
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.toc_open {
+                if self.agent_inbox_open {
+                    self.move_agent_selection(true);
+                } else if self.toc_open {
                     self.move_toc_selection(true);
                 } else {
                     self.set_scroll_and_sync(self.scroll.saturating_sub(1));
@@ -1217,10 +1767,7 @@ impl App {
                 self.set_scroll_and_sync(self.scroll.saturating_sub(delta));
             }
             KeyCode::Char('t') => {
-                self.toc_open = !self.toc_open;
-                if self.toc_open {
-                    self.sync_toc_selected_with_scroll();
-                }
+                self.toggle_toc();
             }
             KeyCode::Tab => {
                 self.cycle_link(false);
@@ -1229,7 +1776,9 @@ impl App {
                 self.cycle_link(true);
             }
             KeyCode::Enter => {
-                if self.toc_open {
+                if self.agent_inbox_open {
+                    self.jump_to_selected_agent_task();
+                } else if self.toc_open {
                     self.jump_to_toc_selected();
                 } else {
                     self.open_selected_link(false)?;
